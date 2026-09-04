@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "product": "CyberHub",
+  "type": "module",
+  "id": "captioner",
+  "name": "Captioner",
+  "summary": "Create local image captions with an OpenAI-compatible vision model.",
+  "version": "1.5",
+  "minimum_hub_version": "1.3.0",
+  "repository": "cyberdeliaAI/CyberHub-Captioner",
+  "publisher_type": "official",
+  "channel": "stable",
+  "dependencies": [],
+  "python_dependencies": [
+    "requests>=2.28"
+  ]
+}
