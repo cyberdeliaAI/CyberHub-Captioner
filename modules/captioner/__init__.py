@@ -3,6 +3,8 @@
 import json
 import os
 import re
+import threading
+import unicodedata
 from core import Module
 from core.server import build_shell
 
@@ -24,12 +26,14 @@ Output only the caption text."""
 
 class CaptionerModule(Module):
     name = "Captioner"
-    version = "1.5"
+    version = "1.6"
+    release_stage = "stable"
     icon = "\U0001F4AC"   # 💬
     description = "Caption images using a local Vision Language Model"
     order = 35
 
     settings_schema = {}
+    _preset_mutation_lock = threading.Lock()
 
     def routes_get(self):
         return {
@@ -37,6 +41,7 @@ class CaptionerModule(Module):
             "/api/captioner/config": self._get_config,
             "/api/captioner/models": self._get_models,
             "/api/captioner/health": self._health,
+            "/api/captioner/presets": self._get_presets,
         }
 
     def routes_post(self):
@@ -44,7 +49,113 @@ class CaptionerModule(Module):
             "/api/captioner/config": self._save_config,
             "/api/captioner/caption": self._caption,
             "/api/captioner/sidecars": self._sidecars,
+            "/api/captioner/presets/save": self._save_preset,
+            "/api/captioner/presets/delete": self._delete_preset,
         }
+
+    def _preset_library(self, handler):
+        library = self.hub.registry.get("library")
+        if library is None or getattr(library, "db", None) is None:
+            handler.respond_json({"error": "Prompt Library is unavailable. Install or enable it to manage saved presets."}, status=503)
+            return None
+        return library
+
+    @staticmethod
+    def _preset_title_key(title):
+        return " ".join(unicodedata.normalize("NFKC", str(title or "")).split()).casefold()
+
+    @staticmethod
+    def _is_captioner_preset(card):
+        return bool(card and (card.get("type") == "captioner" or "captioner-preset" in (card.get("tags") or [])))
+
+    @staticmethod
+    def _all_library_presets(library):
+        """Include legacy tagged presets and every page, not just the first 200."""
+        cards = {}
+        for filters in ({"type_filter": "captioner"}, {"tag_filter": "captioner-preset"}):
+            offset = 0
+            while True:
+                result = library.db.list_cards(limit=200, offset=offset, **filters)
+                batch = result.get("cards") or []
+                cards.update((str(card["id"]), card) for card in batch)
+                offset += len(batch)
+                if not batch or offset >= result.get("total", offset):
+                    break
+        return sorted(cards.values(), key=lambda card: (card.get("updated_at") or 0, card["id"]), reverse=True)
+
+    def _get_presets(self, handler, qs):
+        library = self._preset_library(handler)
+        if library is not None:
+            handler.respond_json({"cards": self._all_library_presets(library)})
+
+    @staticmethod
+    def _preset_id(value):
+        raw = str(value)
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", raw):
+            return None
+        number = int(raw)
+        return number if number <= 9223372036854775807 else None
+
+    def _save_preset(self, handler, content_len, content_type):
+        data = handler.read_body_json(content_len)
+        if not isinstance(data, dict):
+            handler.respond_json({"error": "Invalid preset data"}, status=400)
+            return
+        title, content = data.get("title"), data.get("content")
+        if (not isinstance(title, str) or not title.strip() or len(title.strip()) > 200
+                or not isinstance(content, str) or not content.strip() or len(content) > 100000):
+            handler.respond_json({"error": "Use a title of 1–200 characters and a nonempty prompt of at most 100,000 characters."}, status=400)
+            return
+        preset_id = self._preset_id(data["id"]) if "id" in data else None
+        if "id" in data and preset_id is None:
+            handler.respond_json({"error": "Invalid preset ID"}, status=400)
+            return
+        library = self._preset_library(handler)
+        if library is None:
+            return
+        title = title.strip()
+        # Serialize Captioner writes across tabs, including the name check. The
+        # Library retains its own lock and data model; no other module is changed.
+        with self._preset_mutation_lock:
+            original = library.db.get_card(preset_id) if preset_id else None
+            if preset_id and not self._is_captioner_preset(original):
+                handler.respond_json({"error": "Captioner preset not found. Refresh the preset list."}, status=404)
+                return
+            key = self._preset_title_key(title)
+            # Existing duplicate names may still be edited without renaming them.
+            # Creating a preset or renaming one must not introduce a collision.
+            if original is None or key != self._preset_title_key(original.get("title")):
+                duplicate = next((card for card in self._all_library_presets(library)
+                                  if card["id"] != preset_id and self._preset_title_key(card.get("title")) == key), None)
+                if duplicate:
+                    handler.respond_json({"error": "A saved Captioner preset with this name already exists. Choose another title or select that preset and use Update.",
+                                          "duplicate_id": duplicate["id"]}, status=409)
+                    return
+            if original:
+                library.db.update_card(preset_id, {"title": title, "content": content,
+                                                  "type": "captioner", "target": original.get("target") or "general"})
+            else:
+                preset_id = library.db.create_card({"title": title, "content": content,
+                                                   "type": "captioner", "target": "general", "tags": ["captioner-preset"]})
+            handler.respond_json({"ok": True, "id": preset_id, "preset": library.db.get_card(preset_id)})
+
+    def _delete_preset(self, handler, content_len, content_type):
+        data = handler.read_body_json(content_len)
+        preset_id = self._preset_id(data.get("id")) if isinstance(data, dict) else None
+        if preset_id is None:
+            handler.respond_json({"error": "Invalid preset ID"}, status=400)
+            return
+        library = self._preset_library(handler)
+        if library is None:
+            return
+        with self._preset_mutation_lock:
+            if not self._is_captioner_preset(library.db.get_card(preset_id)):
+                handler.respond_json({"error": "Captioner preset not found. Refresh the preset list."}, status=404)
+                return
+            old_attachment = library.db.delete_card(preset_id)
+        if old_attachment:
+            library._cleanup_attachment_if_unused(old_attachment)
+        handler.respond_json({"ok": True, "id": preset_id})
 
     def _get_cfg(self):
         temperature = self._optional_number(self.setting("temperature"))
@@ -111,7 +222,7 @@ class CaptionerModule(Module):
 
     def _page(self, handler, qs):
         html = build_shell(self.hub.registry, self.hub.settings,
-            active_key="captioner", page_title="VL Captioner", body_html=PAGE_BODY)
+            active_key="captioner", page_title="Captioner", body_html=PAGE_BODY)
         handler.respond_html(html)
 
     def _get_config(self, handler, qs):
@@ -283,12 +394,6 @@ PAGE_BODY = r"""
     font-family: var(--mono); font-size: 11px;
     color: var(--text-dim);
 }
-.cap-inline-status {
-    display:flex; align-items:center; gap:7px;
-    margin-bottom:10px;
-    color:var(--text-dim);
-}
-
 .cap-app .cap-btn {
     font: inherit; font-size: 12px; font-weight: 400;
     padding: 7px 12px;
@@ -312,7 +417,7 @@ PAGE_BODY = r"""
 .cap-main { display: flex; flex: 1; overflow: hidden; min-height: 0; }
 
 .cap-sidebar {
-    width: 280px; min-width: 280px;
+    width: 284px; min-width: 284px;
     border-right: 1px solid var(--border);
     background: var(--bg-panel);
     display: flex; flex-direction: column;
@@ -320,8 +425,7 @@ PAGE_BODY = r"""
     min-height: 0;
 }
 .cap-sidebar-scroll {
-    flex: 0 1 auto;
-    max-height: 55%;
+    flex: 1;
     min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
@@ -338,43 +442,6 @@ PAGE_BODY = r"""
     border-bottom: 1px solid var(--border);
     padding: 16px;
 }
-.cap-queue-section {
-    flex: 1 1 180px;
-    min-height: 120px;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    padding-bottom: 8px;
-}
-.cap-collapsible summary {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    cursor: pointer;
-    list-style: none;
-}
-.cap-collapsible summary::-webkit-details-marker { display: none; }
-.cap-collapsible summary::after {
-    content: '+';
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 14px;
-}
-.cap-collapsible[open] summary::after { content: '-'; }
-.cap-collapsible .cap-sidebar-label { margin-bottom: 0; }
-.cap-collapsible .cap-inline-status {
-    flex: 1;
-    justify-content: flex-end;
-    margin-bottom: 0;
-    min-width: 0;
-}
-.cap-collapsible .cap-status-label {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.cap-collapse-body { padding-top: 12px; }
 .cap-sidebar-label {
     font-family: var(--mono);
     font-size: 10px; letter-spacing: 0.12em;
@@ -413,14 +480,6 @@ PAGE_BODY = r"""
 }
 .cap-app .cap-input:focus { border-color: var(--accent); }
 .cap-app .cap-input::placeholder { color: var(--text-dim); }
-.cap-connection-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 12px;
-}
-.cap-secondary-action { width: 100%; margin-top: 8px; }
-
 .cap-drop {
     border: 1px dashed var(--border-light);
     border-radius: 6px;
@@ -467,8 +526,7 @@ PAGE_BODY = r"""
     overflow-y: auto;
     overflow-x: hidden;
     min-height: 0;
-    margin-top: 10px;
-    padding-right: 4px;
+    padding: 8px;
     scrollbar-width: thin;
     scrollbar-color: var(--border-light) transparent;
 }
@@ -562,7 +620,7 @@ PAGE_BODY = r"""
     object-fit: contain;
     border-radius: 4px;
     display: block;
-    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+    box-shadow: 0 8px 32px rgba(0,0,0,.18);
 }
 .cap-empty {
     text-align: center;
@@ -572,7 +630,7 @@ PAGE_BODY = r"""
 .cap-empty p { font-size: 13px; line-height: 1.7; }
 
 .cap-caption-panel {
-    width: 380px; min-width: 380px;
+    width: 36%; min-width: 320px;
     border-left: 1px solid var(--border);
     background: var(--bg-panel);
     display: flex; flex-direction: column;
@@ -596,13 +654,13 @@ PAGE_BODY = r"""
 }
 .cap-app .cap-textarea {
     width: 100%; height: 100%;
-    min-height: 200px;
+    min-height: 120px;
     background: var(--bg-card);
     border: 1px solid var(--border);
     border-radius: 6px;
     color: var(--text);
-    font-family: var(--mono);
-    font-size: 12px; line-height: 1.7;
+    font-family: var(--font);
+    font-size: 14px; line-height: 1.8;
     padding: 12px;
     resize: none; outline: none;
     transition: border-color 0.15s;
@@ -624,7 +682,7 @@ PAGE_BODY = r"""
 }
 .cap-app .cap-select:focus { border-color: var(--accent); }
 .cap-app .cap-preset-row {
-    display: flex; gap: 6px; margin-top: 6px;
+    display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;
 }
 .cap-app .cap-preset-row .cap-btn { flex: 1; font-size: 11px; padding: 5px 8px; }
 .cap-app .cap-preset-editor {
@@ -676,7 +734,7 @@ PAGE_BODY = r"""
     display: flex; gap: 8px; align-items: center; justify-content: space-between;
     flex-shrink: 0;
 }
-.cap-toolbar-left, .cap-toolbar-right { display: flex; gap: 8px; }
+.cap-toolbar-left, .cap-toolbar-right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 .cap-spinner {
     display: inline-block;
@@ -714,73 +772,131 @@ PAGE_BODY = r"""
 
 .cap-app input[type="file"] { display: none; }
 
-@media (max-width: 1100px) {
-    .cap-caption-panel { width: 320px; min-width: 320px; }
+.cap-workspace-header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 22px; border-bottom:1px solid var(--border); background:var(--bg-panel); flex-shrink:0; }
+.cap-workspace-header h1 { font-size:18px; font-weight:600; letter-spacing:-.3px; color:var(--text-bright); line-height:1.3; }
+.cap-workspace-header p { margin-top:3px; font-size:12px; color:var(--text-dim); }
+.cap-settings-link { display:inline-flex; align-items:center; gap:8px; background:none; border:0; color:var(--accent); font:inherit; cursor:pointer; padding:8px 0 8px 12px; }
+.cap-settings-link:hover { color:var(--text-bright); text-decoration:underline; }
+.cap-app :is(button, select, input, textarea):focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.cap-connection-section { padding:12px; }
+.cap-connection-trigger { width:100%; display:flex; align-items:center; gap:10px; border:1px solid transparent; border-radius:8px; padding:8px; background:transparent; color:var(--text); font:inherit; text-align:left; cursor:pointer; }
+.cap-connection-trigger:hover { border-color:var(--border-light); background:var(--bg-hover); }
+.cap-connection-copy { display:flex; flex-direction:column; gap:4px; flex:1; min-width:0; }
+.cap-connection-title { color:var(--text-bright); font-size:12px; font-weight:500; }
+.cap-status-dot { flex-shrink:0; }
+.cap-status-label { font-family:var(--font); font-size:11px; }
+.cap-connection-arrow { color:var(--text-dim); font-size:22px; }
+.cap-sidebar-label { display:block; letter-spacing:.08em; }
+.cap-drop { display:block; width:100%; font-family:inherit; }
+.cap-input-actions { flex-wrap:wrap; }
+.cap-sidecar-toggle { font-size:11px; }
+.cap-sidecar-status { white-space:normal; }
+.cap-preset-editor { scrollbar-width:thin; }
+.cap-prompt-transfer { margin-top:8px; }
+.cap-prompt-transfer[data-error="true"] { color:var(--red); }
+.cap-queue-column { width:196px; min-width:196px; display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--border); background:var(--bg-panel); }
+.cap-queue-header { display:flex; align-items:center; justify-content:space-between; padding:16px 14px; border-bottom:1px solid var(--border); }
+.cap-queue-count { font:11px var(--mono); color:var(--text-dim); background:var(--bg-card); border:1px solid var(--border); border-radius:5px; padding:1px 6px; }
+.cap-queue-empty { padding:18px 6px; color:var(--text-dim); font-size:11px; line-height:1.7; }
+.cap-queue-item { width:100%; font:inherit; text-align:left; color:var(--text); background:transparent; border-radius:6px; padding:8px 6px; }
+.cap-queue-thumb { width:38px; height:44px; border-radius:4px; }
+.cap-queue-name { font-size:11px; }
+.cap-queue-status { font-family:var(--font); font-size:10px; }
+.cap-queue-status.pending { color:var(--text-dim); }
+.cap-queue-status.edited { color:var(--orange); }
+.cap-sidebar-footer { padding:12px; }
+.cap-progress-bar { height:4px; }
+.cap-image-panel { padding:24px; }
+.cap-image-panel img { min-height:0; }
+.cap-panel-header { gap:10px; flex-wrap:wrap; }
+.cap-panel-title { letter-spacing:.08em; }
+.cap-caption-area { padding:16px; display:flex; overflow:hidden; }
+.cap-caption-area .cap-textarea { flex:1; min-height:0; }
+.cap-edit-feedback { padding:0 16px 14px; font-size:11px; color:var(--text-dim); line-height:1.6; }
+.cap-edit-feedback #captionSaveStatus { color:var(--text); display:block; margin-bottom:4px; }
+.cap-edit-feedback #captionSaveStatus[data-error="true"] { color:var(--red); }
+.cap-caption-meta { gap:12px; }
+#currentFile { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:right; }
+#tokenCount { flex-shrink:0; }
+.cap-toolbar { flex-wrap:wrap; gap:12px 20px; padding:12px 16px; }
+.cap-toolbar-label { color:var(--text-dim); font-size:11px; }
+.cap-app .cap-target-label { margin:0; }
+.cap-settings-dialog { margin:auto; width:min(600px, calc(100vw - 32px)); max-height:calc(100dvh - 40px); padding:0; background:var(--bg-panel); color:var(--text); border:1px solid var(--border-light); border-radius:14px; box-shadow:0 24px 80px rgba(0,0,0,.5); font:13px var(--font); }
+.cap-settings-dialog::backdrop { background:rgba(0,0,0,.65); backdrop-filter:blur(4px); }
+.cap-settings-dialog form { display:flex; flex-direction:column; max-height:calc(100dvh - 42px); }
+.cap-dialog-header { padding:22px 24px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+.cap-dialog-header h2 { font-size:18px; font-weight:600; color:var(--text-bright); }
+.cap-dialog-header p, .cap-settings-section p { font-size:12px; line-height:1.6; color:var(--text-dim); margin-top:4px; }
+.cap-app .cap-close { font-size:22px; padding:0 8px; background:transparent; border-color:transparent; }
+.cap-dialog-body { overflow-y:auto; padding:20px 24px; }
+.cap-settings-section { margin-bottom:14px; }
+.cap-settings-section h3 { font-size:12px; font-weight:600; color:var(--text-bright); }
+.cap-dialog-body > .cap-field + .cap-settings-section { margin-top:24px; padding-top:20px; border-top:1px solid var(--border); }
+.cap-settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px 16px; margin-bottom:16px; }
+.cap-settings-grid .cap-field { margin:0; }
+.cap-settings-dialog .cap-input { padding:9px 11px; }
+.cap-settings-dialog .cap-field label { color:var(--text); font-size:12px; }
+.cap-settings-dialog .cap-field-note { font-size:11px; }
+.cap-settings-feedback { margin-top:12px; font-size:12px; line-height:1.5; color:var(--text); }
+.cap-settings-feedback:empty { display:none; }
+.cap-settings-feedback[data-error="true"] { color:var(--red); }
+.cap-dialog-footer { padding:16px 24px; border-top:1px solid var(--border); display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; }
+.cap-dialog-footer > div { display:flex; gap:8px; }
+@media (max-width: 1250px) {
+    .cap-sidebar { width:260px; min-width:260px; }
+    .cap-queue-column { width:180px; min-width:180px; }
+    .cap-caption-panel { width:42%; min-width:300px; }
+    .cap-image-panel { padding:18px; }
 }
-@media (max-width: 900px) {
-    .cap-sidebar { width: 240px; min-width: 240px; }
-    .cap-caption-panel { width: 280px; min-width: 280px; }
+@media (max-width: 1080px) {
+    .cap-viewer { flex-direction:column; }
+    .cap-image-panel { flex:1; min-height:160px; }
+    .cap-caption-panel { flex:1; width:auto; min-width:0; min-height:240px; border-left:0; border-top:1px solid var(--border); }
+}
+@media (max-width: 720px) {
+    .cap-app { height:auto; min-height:calc(100dvh - 48px); overflow:visible; }
+    .cap-workspace-header { padding:14px 16px; }
+    .cap-workspace-header p { max-width:220px; }
+    .cap-main { flex-direction:column; overflow:visible; }
+    .cap-sidebar { width:100%; min-width:0; border-right:0; }
+    .cap-sidebar-scroll { overflow:visible; }
+    .cap-queue-column { width:100%; min-width:0; height:300px; border-right:0; border-bottom:1px solid var(--border); }
+    .cap-content { overflow:visible; }
+    .cap-viewer { flex:none; height:700px; }
+    .cap-settings-grid { grid-template-columns:1fr 1fr; }
+    .cap-dialog-header, .cap-dialog-body, .cap-dialog-footer { padding:16px; }
 }
 </style>
 <div class="cap-app">
+<header class="cap-workspace-header">
+    <div><h1>Captioner</h1><p>Prepare, caption and refine your image dataset.</p></div>
+    <button class="cap-settings-link" id="connectionSettingsLink" type="button" onclick="openConnectionSettings()" aria-haspopup="dialog" aria-controls="connectionDialog">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--bg-panel)"/><circle cx="15" cy="17" r="3" fill="var(--bg-panel)"/></svg>
+        Settings
+    </button>
+</header>
 
 <div class="cap-main">
     <div class="cap-sidebar">
         <div class="cap-sidebar-scroll">
-        <details class="cap-sidebar-section cap-collapsible" id="connectionDetails">
-            <summary>
-                <span class="cap-sidebar-label">Connection</span>
-                <span class="cap-inline-status"><span class="cap-status-dot" id="statusDot"></span><span class="cap-status-label" id="statusLabel">checking...</span></span>
-            </summary>
-            <div class="cap-collapse-body">
-                <div class="cap-field">
-                    <label for="capApiUrl">API URL</label>
-                    <input class="cap-input" id="capApiUrl" type="text" spellcheck="false" placeholder="http://localhost:1234">
-                    <div class="cap-field-note">With or without <code>/v1</code>.</div>
-                </div>
-                <div class="cap-field">
-                    <label for="capModel">Model</label>
-                    <input class="cap-input" id="capModel" type="text" spellcheck="false" placeholder="LM Studio default">
-                </div>
-                <div class="cap-field">
-                    <label for="capTemperature">Temperature</label>
-                    <input class="cap-input" id="capTemperature" type="number" min="0" max="2" step="0.05" placeholder="LM Studio default">
-                </div>
-                <div class="cap-field">
-                    <label for="capTopP">Top P</label>
-                    <input class="cap-input" id="capTopP" type="number" min="0" max="1" step="0.01" placeholder="LM Studio default">
-                </div>
-                <div class="cap-field">
-                    <label for="capMaxTokens">Max tokens</label>
-                    <input class="cap-input" id="capMaxTokens" type="number" min="1" max="131072" step="1" placeholder="LM Studio default">
-                </div>
-                <div class="cap-field">
-                    <label for="capTopK">Top K</label>
-                    <input class="cap-input" id="capTopK" type="number" min="0" max="1000" step="1" placeholder="LM Studio default">
-                </div>
-                <div class="cap-field">
-                    <label for="capPresencePenalty">Presence penalty</label>
-                    <input class="cap-input" id="capPresencePenalty" type="number" min="-2" max="2" step="0.1" placeholder="LM Studio default">
-                    <div class="cap-field-note">Empty model and generation fields use LM Studio.</div>
-                </div>
-                <div class="cap-connection-actions">
-                    <button class="cap-btn" id="detectModelBtn" onclick="detectCaptionerModel()">Detect model</button>
-                    <button class="cap-btn primary" id="saveConnectionBtn" onclick="saveConnectionConfig()">Save</button>
-                </div>
-                <button class="cap-btn cap-secondary-action" id="clearCaptionerOverridesBtn" onclick="clearCaptionerOverrides()">Clear generation overrides</button>
-            </div>
-        </details>
+        <div class="cap-sidebar-section cap-connection-section">
+            <button class="cap-connection-trigger" id="connectionTrigger" type="button" onclick="openConnectionSettings()" aria-haspopup="dialog" aria-controls="connectionDialog" title="Open Captioner settings">
+                <span class="cap-status-dot" id="statusDot"></span>
+                <span class="cap-connection-copy"><span class="cap-connection-title">Connection</span><span class="cap-status-label" id="statusLabel" aria-live="polite">Checking connection…</span></span>
+                <span class="cap-connection-arrow" aria-hidden="true">›</span>
+            </button>
+        </div>
 
         <div class="cap-sidebar-section">
             <div class="cap-sidebar-label">Input</div>
-            <div class="cap-drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
+            <button type="button" class="cap-drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                     <rect x="3" y="3" width="18" height="18" rx="2"/>
                     <circle cx="8.5" cy="8.5" r="1.5"/>
                     <polyline points="21 15 16 10 5 21"/>
                 </svg>
                 Drop images here<br>or click to browse
-            </div>
+            </button>
             <input type="file" id="fileInput" accept="image/*" multiple>
             <input type="file" id="folderInput" accept="image/*" multiple webkitdirectory>
             <div class="cap-input-actions">
@@ -794,15 +910,26 @@ PAGE_BODY = r"""
         </div>
 
         <div class="cap-sidebar-section">
-            <div class="cap-sidebar-label">Vision script</div>
+            <label class="cap-sidebar-label" for="presetSelect">Vision script</label>
             <select id="presetSelect" class="cap-select" onchange="onPresetChange()" title="Pick the vision instruction sent to the model before each caption request.">
                 <option value="built:z_image">Z-Image LoRA training</option>
             </select>
+            <div class="cap-field">
+                <label for="presetTitle">Prompt title</label>
+                <input class="cap-input" id="presetTitle" type="text" maxlength="200" placeholder="Name your system prompt">
+            </div>
+            <textarea id="presetEditor" class="cap-textarea cap-preset-editor" rows="4" aria-label="System prompt" placeholder="Vision script content..." title="Edit the active script. Save as preset to keep your changes."></textarea>
             <div class="cap-preset-row">
                 <button class="cap-btn" id="savePresetBtn" onclick="saveAsPreset()" title="Save the current script as a new Library preset">Save as preset</button>
-                <button class="cap-btn" id="updatePresetBtn" onclick="updatePreset()" style="display:none" title="Overwrite the selected preset">↻ Update</button>
+                <button class="cap-btn" id="updatePresetBtn" onclick="updatePreset()" style="display:none" title="Overwrite the selected preset">Update</button>
+                <button class="cap-btn danger" id="deletePresetBtn" onclick="deletePreset()" style="display:none" title="Delete the selected saved preset from the Library">Delete preset</button>
             </div>
-            <textarea id="presetEditor" class="cap-textarea cap-preset-editor" rows="4" placeholder="Vision script content..." title="Edit the active script. Save as preset to keep your changes."></textarea>
+            <div class="cap-preset-row">
+                <button class="cap-btn" id="importPromptBtn" type="button" onclick="document.getElementById('promptJsonInput').click()">Import JSON</button>
+                <button class="cap-btn" id="exportPromptBtn" type="button" onclick="exportPromptJson()" title="Download the current title and system prompt">Export JSON</button>
+            </div>
+            <input type="file" id="promptJsonInput" accept=".json,application/json" onchange="importPromptFile(this)">
+            <div class="cap-field-note cap-prompt-transfer" id="promptTransferStatus" role="status">Share a title and system prompt as JSON.</div>
             <div class="cap-field">
                 <label for="capTriggerWord">Trigger word (optional)</label>
                 <input class="cap-input" id="capTriggerWord" type="text" maxlength="200" spellcheck="false" placeholder="e.g. ohwx_person">
@@ -824,11 +951,11 @@ PAGE_BODY = r"""
         </div>
         </div>
 
-        <div class="cap-sidebar-section cap-queue-section">
-            <div class="cap-sidebar-label">Queue</div>
-            <div class="cap-queue" id="queueList"></div>
-        </div>
+    </div>
 
+    <aside class="cap-queue-column" aria-label="Image queue">
+        <div class="cap-queue-header"><h2 class="cap-panel-title">Queue</h2><span class="cap-queue-count" id="queueCount">0</span></div>
+        <div class="cap-queue" id="queueList" aria-label="Queued images"><div class="cap-queue-empty">Your images will appear here.<br>Add files or open a folder to start.</div></div>
         <div class="cap-sidebar-footer">
             <div class="cap-progress-bar"><div class="cap-progress-fill" id="progressFill"></div></div>
             <div class="cap-footer-summary">
@@ -836,12 +963,12 @@ PAGE_BODY = r"""
             </div>
             <div class="cap-batch-actions">
                     <button class="cap-btn primary" id="runUncaptionedBtn" disabled onclick="runUncaptioned()" title="Caption only images that do not have a caption yet">Run uncaptioned</button>
-                    <button class="cap-btn primary" id="runAllBtn" disabled onclick="runAll()">Run all</button>
+                    <button class="cap-btn" id="runAllBtn" disabled onclick="runAll()">Run all</button>
                     <button class="cap-btn danger" id="stopAllBtn" style="display:none" onclick="stopAll()">Stop</button>
                     <button class="cap-btn danger" id="clearBtn" disabled onclick="clearAll()">Clear</button>
             </div>
         </div>
-    </div>
+    </aside>
 
     <div class="cap-content">
         <div class="cap-viewer">
@@ -865,7 +992,11 @@ PAGE_BODY = r"""
                     </div>
                 </div>
                 <div class="cap-caption-area">
-                    <textarea class="cap-textarea" id="captionOutput" placeholder="Caption will appear here..." spellcheck="false"></textarea>
+                    <textarea class="cap-textarea" id="captionOutput" aria-label="Caption output" aria-describedby="captionEditNote captionSaveStatus" disabled placeholder="Caption will appear here..." spellcheck="false"></textarea>
+                </div>
+                <div class="cap-edit-feedback">
+                    <span id="captionSaveStatus" role="status">Select an image to edit its caption.</span>
+                    <p id="captionEditNote">Edits are kept in this browser. Save caption files writes the latest text.</p>
                 </div>
                 <div class="cap-caption-meta">
                     <span id="tokenCount">— words</span>
@@ -876,8 +1007,7 @@ PAGE_BODY = r"""
 
         <div class="cap-toolbar">
             <div class="cap-toolbar-left">
-                <button class="cap-btn" onclick="copyCaption()">Copy caption</button>
-                <button class="cap-btn" onclick="copyAll()">Copy all</button>
+                <span class="cap-toolbar-label">Library</span>
                 <label class="cap-target-label" title="Tags saved cards with this target so Library filters work">Target
                     <select id="saveTargetSelect" class="cap-select cap-target-select">
                         <option value="general">General</option>
@@ -890,18 +1020,62 @@ PAGE_BODY = r"""
                         <option value="suno">Suno</option>
                     </select>
                 </label>
-                <button class="cap-btn" onclick="saveCurrentToLibrary()">📚 Save to library</button>
-                <button class="cap-btn" onclick="saveAllToLibrary()">📚 Save all</button>
+                <button class="cap-btn" onclick="saveCurrentToLibrary()">Save current</button>
+                <button class="cap-btn" onclick="saveAllToLibrary()">Save all</button>
             </div>
             <div class="cap-toolbar-right">
-                <button class="cap-btn" onclick="saveSidecarsNow()">Save caption files</button>
-                <button class="cap-btn" onclick="exportTxt()">⬇ .txt</button>
-                <button class="cap-btn" onclick="exportCsv()">⬇ .csv</button>
+                <button class="cap-btn" onclick="copyAll()">Copy all</button>
+                <button class="cap-btn primary" id="saveCaptionFilesBtn" disabled onclick="saveSidecarsNow()">Save caption files</button>
+                <button class="cap-btn" onclick="exportTxt()">Export .txt</button>
+                <button class="cap-btn" onclick="exportCsv()">Export .csv</button>
             </div>
         </div>
     </div>
 </div>
 
+<dialog class="cap-settings-dialog" id="connectionDialog" aria-labelledby="connectionDialogTitle" aria-describedby="connectionDialogDescription">
+    <form id="connectionForm" onsubmit="event.preventDefault(); saveConnectionConfig()">
+        <header class="cap-dialog-header"><div><h2 id="connectionDialogTitle">Captioner settings</h2><p id="connectionDialogDescription">Connect your vision model and adjust generation.</p></div><button class="cap-btn cap-close" type="button" onclick="closeConnectionSettings()" aria-label="Close settings">×</button></header>
+        <div class="cap-dialog-body">
+            <div class="cap-settings-section"><h3>Connection</h3><p>Use a server with a vision-capable model loaded.</p></div>
+                <div class="cap-field">
+                    <label for="capApiUrl">API URL</label>
+                    <input class="cap-input" id="capApiUrl" type="text" required spellcheck="false" placeholder="http://localhost:1234">
+                    <div class="cap-field-note">Your LM Studio or OpenAI-compatible server. With or without <code>/v1</code>.</div>
+                </div>
+                <div class="cap-field">
+                    <label for="capModel">Model</label>
+                    <input class="cap-input" id="capModel" type="text" spellcheck="false" placeholder="LM Studio default">
+                </div>
+                <div class="cap-settings-section"><h3>Generation overrides</h3><p>Leave fields empty to use the server defaults.</p></div>
+                <div class="cap-settings-grid">
+                <div class="cap-field">
+                    <label for="capTemperature">Temperature</label>
+                    <input class="cap-input" id="capTemperature" type="number" min="0" max="2" step="0.05" placeholder="LM Studio default">
+                </div>
+                <div class="cap-field">
+                    <label for="capTopP">Top P</label>
+                    <input class="cap-input" id="capTopP" type="number" min="0" max="1" step="0.01" placeholder="LM Studio default">
+                </div>
+                <div class="cap-field">
+                    <label for="capMaxTokens">Max tokens</label>
+                    <input class="cap-input" id="capMaxTokens" type="number" min="1" max="131072" step="1" placeholder="LM Studio default">
+                </div>
+                <div class="cap-field">
+                    <label for="capTopK">Top K</label>
+                    <input class="cap-input" id="capTopK" type="number" min="0" max="1000" step="1" placeholder="LM Studio default">
+                </div>
+                <div class="cap-field">
+                    <label for="capPresencePenalty">Presence penalty</label>
+                    <input class="cap-input" id="capPresencePenalty" type="number" min="-2" max="2" step="0.1" placeholder="LM Studio default">
+                </div>
+                </div>
+            <button class="cap-btn" type="button" id="clearCaptionerOverridesBtn" onclick="clearCaptionerOverrides()">Clear generation overrides</button>
+            <p class="cap-settings-feedback" id="connectionFeedback" role="status"></p>
+        </div>
+        <footer class="cap-dialog-footer"><button class="cap-btn" type="button" id="detectModelBtn" onclick="detectCaptionerModel()">Detect model</button><div><button class="cap-btn" type="button" onclick="closeConnectionSettings()">Cancel</button><button class="cap-btn primary" id="saveConnectionBtn" type="submit">Save settings</button></div></footer>
+    </form>
+</dialog>
 </div>
 
 <div class="cap-toast" id="toast"></div>
@@ -919,6 +1093,9 @@ const state = {
      activeOverride is the live textarea content shipped as override_prompt; lets the user
      tweak before running without permanently changing the preset card. */
   presets: [],
+  importedPreset: null,
+  importingPrompt: false,
+  presetBusy: false,
   activePreset: null,
   activeOverride: '',
   autoTagger: { available: false, ready: false, runtimeReady: false },
@@ -1090,9 +1267,15 @@ const CONSTANT_TRAITS_STORAGE_KEY = 'cyberdelia.captioner.constantTraits';
 const WD_THRESHOLD_STORAGE_KEY = 'cyberdelia.captioner.wdThreshold';
 let sessionSaveTimer = null;
 let restoringSession = false;
+let sessionSaveState = '';
+let sessionSaveRevision = 0;
 
 async function init() {
-  setupCollapsibleSections();
+  setupConnectionDialog();
+  document.getElementById('presetTitle').addEventListener('input', () => {
+    syncImportedPrompt();
+    scheduleSaveSession();
+  });
   await loadConnectionConfig();
   checkConnection();
   setInterval(checkConnection, 15000);
@@ -1103,6 +1286,7 @@ async function init() {
   const ed = document.getElementById('presetEditor');
   if (ed) ed.addEventListener('input', function(){
     state.activeOverride = ed.value;
+    syncImportedPrompt();
     updateWdHybridUi();
     scheduleSaveSession();
   });
@@ -1145,29 +1329,55 @@ async function init() {
   updateSidecarUi();
 }
 
-function setupCollapsibleSections() {
-  const el = document.getElementById('connectionDetails');
-  if (!el) return;
-  const key = 'cyberdelia.captioner.connectionOpen';
-  const saved = localStorage.getItem(key);
-  el.open = saved === null ? false : saved === '1';
-  el.addEventListener('toggle', () => {
-    localStorage.setItem(key, el.open ? '1' : '0');
+function populateConnectionForm(cfg) {
+  document.getElementById('capApiUrl').value = cfg.api_url || 'http://localhost:1234/v1';
+  document.getElementById('capModel').value = cfg.model || '';
+  for (const [key, id] of Object.entries({ temperature: 'capTemperature', top_p: 'capTopP', max_tokens: 'capMaxTokens', top_k: 'capTopK', presence_penalty: 'capPresencePenalty' })) {
+    document.getElementById(id).value = cfg[key] ?? '';
+  }
+}
+
+function connectionFeedback(message='', error=false) {
+  const el = document.getElementById('connectionFeedback');
+  el.textContent = message;
+  el.dataset.error = String(error);
+}
+
+function setupConnectionDialog() {
+  const dialog = document.getElementById('connectionDialog');
+  dialog.addEventListener('click', event => {
+    const rect = dialog.getBoundingClientRect();
+    if (event.target === dialog && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) closeConnectionSettings();
   });
+  dialog.addEventListener('cancel', event => {
+    if (state.connectionBusy) event.preventDefault();
+  });
+  dialog.addEventListener('close', () => populateConnectionForm(state.config || {}));
+}
+
+function openConnectionSettings() {
+  populateConnectionForm(state.config || {});
+  connectionFeedback();
+  document.getElementById('connectionDialog').showModal();
+  document.getElementById('capApiUrl').focus();
+}
+
+function closeConnectionSettings() {
+  if (!state.connectionBusy) document.getElementById('connectionDialog').close();
+}
+
+function setConnectionBusy(busy) {
+  state.connectionBusy = busy;
+  document.querySelectorAll('#connectionForm button, #connectionForm input').forEach(el => { el.disabled = busy; });
 }
 
 async function loadConnectionConfig() {
   try {
     const r = await fetch('/api/captioner/config');
+    if (!r.ok) throw new Error('Config unavailable');
     const cfg = await r.json();
     state.config = cfg || {};
-    document.getElementById('capApiUrl').value = cfg.api_url || 'http://localhost:1234/v1';
-    document.getElementById('capModel').value = cfg.model || '';
-    document.getElementById('capTemperature').value = cfg.temperature ?? '';
-    document.getElementById('capTopP').value = cfg.top_p ?? '';
-    document.getElementById('capMaxTokens').value = cfg.max_tokens ?? '';
-    document.getElementById('capTopK').value = cfg.top_k ?? '';
-    document.getElementById('capPresencePenalty').value = cfg.presence_penalty ?? '';
+    populateConnectionForm(state.config);
   } catch(e) {
     toast('Could not load captioner settings', 'error-toast');
   }
@@ -1202,18 +1412,17 @@ function readConnectionForm() {
   };
 }
 
-async function clearCaptionerOverrides() {
+function clearCaptionerOverrides() {
   ['capTemperature', 'capTopP', 'capMaxTokens', 'capTopK', 'capPresencePenalty']
     .forEach(id => { document.getElementById(id).value = ''; });
-  const saved = await saveConnectionConfig({ quiet: true });
-  toast(saved ? 'LM Studio generation settings will be used' : 'Could not save settings',
-        saved ? 'success' : 'error-toast');
+  connectionFeedback('Overrides cleared. Save settings to use the server defaults.');
 }
 
-async function saveConnectionConfig(options={}) {
-  const btn = document.getElementById('saveConnectionBtn');
+async function saveConnectionConfig() {
+  if (state.connectionBusy || !document.getElementById('connectionForm').reportValidity()) return false;
   const cfg = readConnectionForm();
-  if (btn && !options.quiet) btn.disabled = true;
+  setConnectionBusy(true);
+  connectionFeedback('Saving settings…');
   try {
     const r = await fetch('/api/captioner/config', {
       method: 'POST',
@@ -1223,45 +1432,39 @@ async function saveConnectionConfig(options={}) {
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.error) throw new Error(data.error || 'Save failed');
     state.config = cfg;
-    if (!options.quiet) toast('Captioner connection saved', 'success');
-    await checkConnection();
+    document.getElementById('connectionDialog').close();
+    toast('Captioner settings saved', 'success');
+    checkConnection();
     return true;
   } catch(e) {
-    if (!options.quiet) toast('Save failed: ' + e.message, 'error-toast');
+    connectionFeedback('Save failed: ' + e.message, true);
     return false;
   } finally {
-    if (btn) btn.disabled = false;
+    setConnectionBusy(false);
   }
 }
 
 async function detectCaptionerModel() {
-  const btn = document.getElementById('detectModelBtn');
-  if (btn) btn.disabled = true;
-  const saved = await saveConnectionConfig({ quiet: true });
-  if (!saved) {
-    if (btn) btn.disabled = false;
-    toast('Save the API URL first', 'error-toast');
-    return;
-  }
+  if (state.connectionBusy || !document.getElementById('connectionForm').reportValidity()) return;
+  const cfg = readConnectionForm();
+  setConnectionBusy(true);
+  connectionFeedback('Looking for loaded models…');
   try {
-    const data = await fetchCaptionerModels();
-    const models = data.models;
-    if (!models.length) throw new Error('No models found');
-    document.getElementById('capModel').value = models[0];
-    await saveConnectionConfig({ quiet: true });
-    toast('Detected: ' + models[0], 'success');
+    const data = await fetchCaptionerModels(cfg);
+    document.getElementById('capModel').value = data.models[0];
+    connectionFeedback('Detected ' + data.models[0] + '. Save settings to use this model.');
   } catch(e) {
-    toast('Detect failed: ' + e.message, 'error-toast');
+    connectionFeedback('Detect failed: ' + e.message, true);
   } finally {
-    if (btn) btn.disabled = false;
+    setConnectionBusy(false);
+    document.getElementById('detectModelBtn').focus();
   }
 }
 
-async function fetchCaptionerModels() {
-  const cfg = readConnectionForm();
+async function fetchCaptionerModels(cfg=state.config || {}) {
   let directError = null;
   try {
-    const r = await fetch(cfg.api_url + '/models');
+    const r = await fetch(normalizeCaptionerApiUrl(cfg.api_url) + '/models', { signal: AbortSignal.timeout(5000) });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error?.message || data.error || `HTTP ${r.status}`);
     const models = (data.data || []).map(item => item && item.id).filter(Boolean);
@@ -1271,6 +1474,9 @@ async function fetchCaptionerModels() {
     directError = e;
   }
 
+  if (normalizeCaptionerApiUrl(cfg.api_url) !== normalizeCaptionerApiUrl(state.config?.api_url)) {
+    throw new Error('Save this API URL first to detect models through CyberHub.');
+  }
   const r = await fetch('/api/captioner/models');
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data.error || !(data.models || []).length) {
@@ -1282,45 +1488,42 @@ async function fetchCaptionerModels() {
 /* Saved captioner presets are Library cards with type='captioner'. Built-in
    vision scripts are local defaults; save one as a preset before updating it. */
 async function loadPresets(options={}) {
+  renderPresetOptions();
+  if (!state.activePreset) onPresetChange({ skipSave: true });
   try {
-    const stamp = Date.now();
-    const responses = await Promise.all([
-      fetch('/api/library/cards?type=captioner&limit=200&_=' + stamp, { cache: 'no-store' }),
-      fetch('/api/library/cards?tag=captioner-preset&limit=200&_=' + stamp, { cache: 'no-store' })
-    ]);
-    if (!responses[0].ok || !responses[1].ok) {
-      throw new Error(`Preset request failed (${responses[0].status}/${responses[1].status})`);
-    }
-    const payloads = await Promise.all(responses.map(response => response.json()));
-    const presetMap = new Map();
-    payloads.forEach(data => (data?.cards || []).forEach(card => {
-      presetMap.set(String(card.id), card);
-    }));
-    state.presets = Array.from(presetMap.values()).sort(
-      (a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0)
-    );
-    const sel = document.getElementById('presetSelect');
-    if (!sel) return;
-    /* Remember the current selection so a refresh after Save/Update doesn't reset it */
-    const cur = options.selectedValue || sel.value || 'built:z_image';
-    const visibleBuiltins = BUILTIN_VISION_SCRIPTS.filter(function(p){
-      return !p.requiresAutoTagger || state.autoTagger.available;
-    });
-    const builtins = '<optgroup label="Built-in vision scripts">'
-      + visibleBuiltins.map(function(p){
-          return '<option value="' + p.id + '">' + escapeHtml(p.title) + '</option>';
-        }).join('')
-      + '</optgroup>';
-    const saved = state.presets.length
-      ? '<optgroup label="Saved presets">' + state.presets.map(function(p){
-          return '<option value="saved:' + p.id + '">' + escapeHtml(p.title || 'Untitled') + '</option>';
-        }).join('') + '</optgroup>'
-      : '';
-    sel.innerHTML = builtins + saved;
-    const exists = Array.from(sel.options).some(function(opt){ return opt.value === cur; });
-    sel.value = exists ? cur : 'built:z_image';
-    onPresetChange({ skipSave: true });
-  } catch(e) { /* non-fatal — sidebar keeps the built-in scripts */ }
+    const response = await fetch('/api/captioner/presets?_=' + Date.now(), { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok || !Array.isArray(data.cards)) throw new Error(data.error || 'Could not load presets');
+    state.presets = data.cards;
+  } catch(e) { /* The local scripts and imported prompt remain available. */ }
+  renderPresetOptions(options.selectedValue);
+  if (options.selectedValue || !state.activePreset) onPresetChange({ skipSave: true });
+}
+
+function renderPresetOptions(selectedValue) {
+  const sel = document.getElementById('presetSelect');
+  const cur = selectedValue || sel.value || 'built:z_image';
+  const visibleBuiltins = BUILTIN_VISION_SCRIPTS.filter(p => !p.requiresAutoTagger || state.autoTagger.available);
+  const builtins = '<optgroup label="Built-in vision scripts">'
+    + visibleBuiltins.map(p => '<option value="' + p.id + '">' + escapeHtml(p.title) + '</option>').join('')
+    + '</optgroup>';
+  const imported = state.importedPreset
+    ? '<optgroup label="Imported prompt"><option value="imported:current">' + escapeHtml(state.importedPreset.title || 'Untitled import') + '</option></optgroup>'
+    : '';
+  const titleCounts = new Map();
+  state.presets.forEach(p => {
+    const key = String(p.title || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+    titleCounts.set(key, (titleCounts.get(key) || 0) + 1);
+  });
+  const saved = state.presets.length
+    ? '<optgroup label="Saved presets">' + state.presets.map(p => {
+        const key = String(p.title || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+        const label = (p.title || 'Untitled') + (titleCounts.get(key) > 1 ? ' · #' + p.id : '');
+        return '<option value="saved:' + escapeHtml(p.id) + '">' + escapeHtml(label) + '</option>';
+      }).join('') + '</optgroup>'
+    : '';
+  sel.innerHTML = builtins + imported + saved;
+  sel.value = Array.from(sel.options).some(opt => opt.value === cur) ? cur : 'built:z_image';
 }
 
 function onPresetChange(options={}) {
@@ -1332,13 +1535,19 @@ function onPresetChange(options={}) {
   const rawId = isSaved ? value.slice(6) : value;
   const p = isSaved
     ? state.presets.find(function(x){ return String(x.id) === String(rawId); })
+    : value === 'imported:current' ? state.importedPreset
     : BUILTIN_VISION_SCRIPTS.find(function(x){ return x.id === rawId; });
   if (!p) return;
   state.activePreset = Object.assign({ builtin: !isSaved }, p);
   state.activeOverride = p.content || '';
+  document.getElementById('presetTitle').value = p.title || '';
   ed.value = state.activeOverride;
   ed.classList.add('active');
   upd.style.display = isSaved ? '' : 'none';
+  document.getElementById('deletePresetBtn').style.display = isSaved ? '' : 'none';
+  promptTransferFeedback(value === 'imported:current'
+    ? 'Imported into the editor. Save as preset to add it to your Library.'
+    : 'Share a title and system prompt as JSON.');
   updateWdHybridUi();
   if (!options.skipSave) scheduleSaveSession();
 }
@@ -1426,17 +1635,23 @@ function normalizeSessionStatus(status) {
 function scheduleSaveSession() {
   if (restoringSession) return;
   clearTimeout(sessionSaveTimer);
+  sessionSaveRevision++;
+  sessionSaveState = 'saving';
+  updateCaptionSaveStatus();
   sessionSaveTimer = setTimeout(saveSessionNow, 300);
 }
 
 async function saveSessionNow() {
   if (restoringSession) return;
+  const revision = sessionSaveRevision;
   const presetSel = document.getElementById('presetSelect');
   const targetSel = document.getElementById('saveTargetSelect');
   const record = {
     saved_at: Date.now(),
     activeIdx: state.activeIdx,
     activeOverride: state.activeOverride || '',
+    presetTitle: document.getElementById('presetTitle').value,
+    importedPreset: state.importedPreset,
     presetId: presetSel ? presetSel.value : '',
     target: targetSel ? targetSel.value : 'general',
     images: state.images.map(img => ({
@@ -1451,9 +1666,12 @@ async function saveSessionNow() {
   };
   try {
     await sessionStore('readwrite', store => store.put(record, SESSION_KEY));
+    if (revision === sessionSaveRevision) sessionSaveState = 'saved';
   } catch(e) {
+    if (revision === sessionSaveRevision) sessionSaveState = 'error';
     console.warn('Captioner session was not saved:', e);
   }
+  updateCaptionSaveStatus();
 }
 
 async function clearSession() {
@@ -1469,7 +1687,7 @@ async function restoreSession() {
   restoringSession = true;
   try {
     const record = await sessionStore('readonly', store => store.get(SESSION_KEY));
-    if (!record || !Array.isArray(record.images) || !record.images.length) return;
+    if (!record || !Array.isArray(record.images)) return;
 
     state.images.forEach(i => i.url && URL.revokeObjectURL(i.url));
     state.images = record.images
@@ -1490,15 +1708,19 @@ async function restoreSession() {
         };
       });
 
+    if (record.importedPreset && typeof record.importedPreset.title === 'string'
+        && typeof record.importedPreset.content === 'string') {
+      state.importedPreset = {id: 'imported:current', title: record.importedPreset.title, content: record.importedPreset.content};
+    }
     const presetSel = document.getElementById('presetSelect');
     if (presetSel && record.presetId) {
-      const restoredPresetId = String(record.presetId).startsWith('built:') || String(record.presetId).startsWith('saved:')
+      const restoredPresetId = String(record.presetId).startsWith('built:') || String(record.presetId).startsWith('saved:') || record.presetId === 'imported:current'
         ? String(record.presetId)
         : 'saved:' + record.presetId;
-      presetSel.value = restoredPresetId;
+      renderPresetOptions(restoredPresetId);
       onPresetChange({ skipSave: true });
     }
-    if (record.activeOverride) {
+    if (typeof record.activeOverride === 'string') {
       state.activeOverride = record.activeOverride;
       const ed = document.getElementById('presetEditor');
       if (ed) {
@@ -1506,6 +1728,8 @@ async function restoreSession() {
         if (record.presetId) ed.classList.add('active');
       }
     }
+    if (typeof record.presetTitle === 'string') document.getElementById('presetTitle').value = record.presetTitle;
+    syncImportedPrompt();
     updateWdHybridUi();
     const targetSel = document.getElementById('saveTargetSelect');
     if (targetSel && record.target) targetSel.value = record.target;
@@ -1526,62 +1750,169 @@ async function restoreSession() {
   }
 }
 
-async function saveAsPreset() {
-  /* If the user hasn't picked a preset yet, default to whatever's in the editor (or
-     empty — they'll be prompted to type something). Otherwise we save the current edits. */
-  const ed = document.getElementById('presetEditor');
-  const content = (ed.value || state.activeOverride || '').trim();
-  if (!content) { toast('Nothing to save — load or type a system prompt first', 'error-toast'); return; }
-  const title = window.prompt('Save as new preset\\n\\nTitle:', state.activePreset ? state.activePreset.title + ' (copy)' : 'New captioner preset');
-  if (!title) return;
+// Versioned envelope shared by CyberHub system-prompt files. Each module owns
+// its payload; never infer the destination from a filename or a Library card type.
+const PROMPT_SHARE_SCHEMA = 1;
+const PROMPT_SHARE_MAX_BYTES = 512 * 1024;
+const PROMPT_SHARE_MAX_TITLE = 200;
+const PROMPT_SHARE_MAX_TEXT = 100000;
+
+function validatePromptShare(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)
+      || data.product !== 'CyberHub' || data.type !== 'system_prompt') {
+    throw new Error('Choose a CyberHub system-prompt JSON file.');
+  }
+  if (data.module !== 'captioner') {
+    throw new Error('This prompt is for another module. Choose a Captioner prompt.');
+  }
+  if (data.schema !== PROMPT_SHARE_SCHEMA) {
+    throw new Error('Unsupported prompt format version. Update Captioner or use schema 1.');
+  }
+  if (typeof data.title !== 'string' || !data.title.trim() || data.title.trim().length > PROMPT_SHARE_MAX_TITLE) {
+    throw new Error('The prompt needs a title of 1–200 characters.');
+  }
+  if (typeof data.prompt !== 'string' || !data.prompt.trim() || data.prompt.length > PROMPT_SHARE_MAX_TEXT) {
+    throw new Error('The system prompt must contain text and be at most 100,000 characters.');
+  }
+  return { schema: PROMPT_SHARE_SCHEMA, product: 'CyberHub', type: 'system_prompt',
+    module: 'captioner', title: data.title.trim(), prompt: data.prompt };
+}
+
+function currentPromptShare() {
+  return validatePromptShare({ schema: PROMPT_SHARE_SCHEMA, product: 'CyberHub',
+    type: 'system_prompt', module: 'captioner',
+    title: document.getElementById('presetTitle').value,
+    prompt: document.getElementById('presetEditor').value });
+}
+
+function promptTransferFeedback(message, error=false) {
+  const el = document.getElementById('promptTransferStatus');
+  el.textContent = message;
+  el.dataset.error = String(error);
+}
+
+function syncImportedPrompt() {
+  if (document.getElementById('presetSelect').value !== 'imported:current' || !state.importedPreset) return;
+  state.importedPreset.title = document.getElementById('presetTitle').value;
+  state.importedPreset.content = document.getElementById('presetEditor').value;
+  renderPresetOptions('imported:current');
+}
+
+function applyImportedPrompt(data) {
+  const prompt = validatePromptShare(data);
+  state.importedPreset = {id: 'imported:current', title: prompt.title, content: prompt.prompt};
+  renderPresetOptions('imported:current');
+  onPresetChange();
+}
+
+async function importPromptFile(input) {
+  const file = input.files?.[0];
+  if (!file || state.importingPrompt || state.presetBusy) return;
+  state.importingPrompt = true;
+  document.getElementById('importPromptBtn').disabled = true;
   try {
-    const r = await fetch('/api/library/card', {
+    if (file.size > PROMPT_SHARE_MAX_BYTES) throw new Error('Prompt JSON files must be smaller than 512 KB.');
+    const text = (await file.text()).replace(/^\uFEFF/, '');
+    let data;
+    try { data = JSON.parse(text); }
+    catch { throw new Error('This file is not valid JSON.'); }
+    applyImportedPrompt(data);
+    toast('Captioner prompt imported', 'success');
+  } catch(e) {
+    promptTransferFeedback('Import failed: ' + e.message, true);
+  } finally {
+    input.value = '';
+    state.importingPrompt = false;
+    document.getElementById('importPromptBtn').disabled = false;
+  }
+}
+
+function exportPromptJson() {
+  try {
+    const data = currentPromptShare();
+    const json = JSON.stringify(data, null, 2) + '\n';
+    if (new Blob([json]).size > PROMPT_SHARE_MAX_BYTES) throw new Error('This prompt is too large to share as JSON (512 KB maximum).');
+    const stem = data.title.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'system-prompt';
+    download(stem + '.captioner.json', json, 'application/json');
+    promptTransferFeedback('Exported the current title and prompt. Ready to share.');
+  } catch(e) {
+    promptTransferFeedback('Export failed: ' + e.message, true);
+  }
+}
+
+function setPresetBusy(busy) {
+  state.presetBusy = busy;
+  ['savePresetBtn', 'updatePresetBtn', 'deletePresetBtn', 'importPromptBtn',
+   'exportPromptBtn', 'presetSelect', 'presetTitle', 'presetEditor'].forEach(id => {
+    document.getElementById(id).disabled = busy;
+  });
+}
+
+async function storePreset(preset=null) {
+  if (state.presetBusy || state.importingPrompt) return;
+  let shared;
+  try { shared = currentPromptShare(); }
+  catch(e) { promptTransferFeedback(e.message, true); return; }
+  if (preset && !confirm('Update saved preset "' + preset.title + '" with the current title and prompt?')) return;
+  setPresetBusy(true);
+  promptTransferFeedback('Saving preset…');
+  try {
+    const payload = {title: shared.title, content: shared.prompt};
+    if (preset) payload.id = preset.id;
+    const response = await fetch('/api/captioner/presets/save', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'captioner', target: 'general',
-        title: title.trim(), content: content,
-        tags: ['captioner-preset']
-      })
+      body: JSON.stringify(payload)
     });
-    const data = await r.json();
-    if (data && data.ok) {
-      toast('Preset saved', 'success');
-      await loadPresets({ selectedValue: 'saved:' + data.id });
-    } else {
-      toast('Save failed' + (data && data.error ? ': ' + data.error : ''), 'error-toast');
-    }
-  } catch(e) { toast('Save failed: ' + e, 'error-toast'); }
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Could not save preset');
+    // Update immediately from the committed server result, even if a later
+    // refresh fails. This also makes repeated Save clicks see the new preset.
+    state.presets = state.presets.filter(p => String(p.id) !== String(data.id));
+    state.presets.unshift(data.preset);
+    renderPresetOptions('saved:' + data.id);
+    onPresetChange();
+    promptTransferFeedback(preset ? 'Preset updated in the Library.' : 'Preset saved in the Library. Use Update to change it.');
+    toast(preset ? 'Preset updated' : 'Preset saved', 'success');
+  } catch(e) {
+    promptTransferFeedback('Save failed: ' + e.message, true);
+  } finally {
+    setPresetBusy(false);
+  }
+}
+
+async function saveAsPreset() {
+  return storePreset();
 }
 
 async function updatePreset() {
-  /* Overwrite the selected preset's content with the current editor text. */
-  if (!state.activePreset) return;
-  if (state.activePreset.builtin) { toast('Built-in scripts can be saved as a preset first', 'error-toast'); return; }
-  const ed = document.getElementById('presetEditor');
-  const content = (ed.value || '').trim();
-  if (!content) { toast('Editor is empty — nothing to update', 'error-toast'); return; }
-  if (!confirm('Overwrite preset "' + state.activePreset.title + '"?')) return;
-  const presetId = state.activePreset.id;
+  if (!state.activePreset || state.activePreset.builtin) return;
+  return storePreset(state.activePreset);
+}
+
+async function deletePreset() {
+  if (state.presetBusy || state.importingPrompt || !state.activePreset || state.activePreset.builtin) return;
+  const preset = state.activePreset;
+  if (!confirm('Delete preset "' + preset.title + '" (#' + preset.id + ') from the Library? This cannot be undone.')) return;
+  setPresetBusy(true);
+  promptTransferFeedback('Deleting preset…');
   try {
-    const r = await fetch('/api/library/card/update', {
+    const response = await fetch('/api/captioner/presets/delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: presetId,
-        type: 'captioner',
-        target: state.activePreset.target || 'general',
-        content: content
-      })
+      body: JSON.stringify({id: preset.id})
     });
-    const data = await r.json();
-    if (data && data.ok) {
-      toast('Preset updated', 'success');
-      /* Keep the local copy in sync so a subsequent runOne picks up the new text
-         even before loadPresets() finishes refreshing. */
-      state.activePreset.content = content;
-      state.activeOverride = content;
-      await loadPresets({ selectedValue: 'saved:' + presetId });
-    } else { toast('Update failed' + (data && data.error ? ': ' + data.error : ''), 'error-toast'); }
-  } catch(e) { toast('Update failed: ' + e, 'error-toast'); }
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Could not delete preset');
+    state.presets = state.presets.filter(p => String(p.id) !== String(preset.id));
+    renderPresetOptions('built:z_image');
+    onPresetChange();
+    promptTransferFeedback('Preset deleted from the Library.');
+    toast('Preset deleted', 'success');
+  } catch(e) {
+    promptTransferFeedback('Delete failed: ' + e.message, true);
+  } finally {
+    setPresetBusy(false);
+  }
 }
 
 async function checkConnection() {
@@ -1591,10 +1922,10 @@ async function checkConnection() {
     const data = await fetchCaptionerModels();
     const count = data.models.length;
     dot.className = 'cap-status-dot connected';
-    lbl.textContent = `api connected · ${count} model${count === 1 ? '' : 's'}`;
+    lbl.textContent = `Connected · ${count} model${count === 1 ? '' : 's'}`;
   } catch {
     dot.className = 'cap-status-dot error';
-    lbl.textContent = 'no api';
+    lbl.textContent = 'Not connected · open settings';
   }
 }
 
@@ -1734,16 +2065,25 @@ function sidecarFilename(imageName) {
 }
 
 async function writeSidecar(img) {
-  if (!state.sidecarDirectory || !img || !img.caption) return false;
-  const fileHandle = await state.sidecarDirectory.getFileHandle(sidecarFilename(img.name), { create: true });
-  const writable = await fileHandle.createWritable();
-  try {
-    await writable.write(String(img.caption).trim() + '\n');
-  } finally {
-    await writable.close();
-  }
-  img.sidecarStatus = 'saved';
-  return true;
+  if (!state.sidecarDirectory || !img) return false;
+  const directory = state.sidecarDirectory;
+  const write = async () => {
+    const caption = String(img.caption || '');
+    const revision = img.editRevision || 0;
+    const fileHandle = await directory.getFileHandle(sidecarFilename(img.name), { create: true });
+    const writable = await fileHandle.createWritable();
+    try {
+      await writable.write(caption.trim() + '\n');
+    } finally {
+      await writable.close();
+    }
+    img.sidecarStatus = img.caption === caption && (img.editRevision || 0) === revision ? 'saved' : 'pending';
+    return true;
+  };
+  const pending = (img.sidecarWrite || Promise.resolve()).catch(() => {}).then(write);
+  img.sidecarWrite = pending;
+  try { return await pending; }
+  finally { if (img.sidecarWrite === pending) delete img.sidecarWrite; }
 }
 
 function addFiles(files) {
@@ -1767,26 +2107,35 @@ function addFiles(files) {
 
 function renderQueue() {
   const list = document.getElementById('queueList');
-  list.innerHTML = '';
+  const focusedImageId = document.activeElement?.closest?.('.cap-queue-item')?.dataset.imageId;
+  list.innerHTML = state.images.length ? '' : '<div class="cap-queue-empty">Your images will appear here.<br>Add files or open a folder to start.</div>';
+  document.getElementById('queueCount').textContent = state.images.length;
   state.images.forEach((img, idx) => {
     const safeName = escapeHtml(img.name);
-    const statusClass = img.sidecarStatus === 'error' ? 'error' : img.status;
+    const statusClass = img.sidecarStatus === 'error' ? 'error' :
+      img.sidecarStatus === 'pending' && img.status !== 'running' ? 'edited' : img.status;
     const statusText = img.status === 'pending' ? 'pending' :
       img.status === 'running' ? '<span class="cap-spinner"></span>' + escapeHtml(img.stage || 'captioning') :
+      img.sidecarStatus === 'pending' ? 'Edited · save .txt' :
       img.status === 'done' && img.sidecarStatus === 'saved' ? '✓ done · .txt' :
       img.status === 'done' && img.sidecarStatus === 'error' ? '✓ done · .txt failed' :
       img.status === 'done' ? '✓ done' : '✗ error';
-    const item = document.createElement('div');
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.title = img.name;
+    item.dataset.imageId = String(img.id);
+    item.setAttribute('aria-pressed', String(idx === state.activeIdx));
     item.className = 'cap-queue-item' + (idx === state.activeIdx ? ' active' : '');
     item.onclick = () => selectImage(idx);
     item.innerHTML = `
-      <img class="cap-queue-thumb" src="${img.url}" alt="${safeName}">
+      <img class="cap-queue-thumb" src="${img.url}" alt="">
       <div class="cap-queue-info">
         <div class="cap-queue-name">${safeName}</div>
         <div class="cap-queue-status ${statusClass}">${statusText}</div>
       </div>
     `;
     list.appendChild(item);
+    if (item.dataset.imageId === focusedImageId) item.focus({ preventScroll: true });
   });
   updateProgress();
 }
@@ -1829,6 +2178,9 @@ function updateControls() {
   stopAllBtn.textContent = state.stopRequested ? 'Stopping…' : 'Stop';
   document.getElementById('clearBtn').disabled = !has || state.running;
   document.getElementById('runOneBtn').disabled = !has || state.activeIdx === null || state.running;
+  document.getElementById('captionOutput').disabled = state.activeIdx === null;
+  document.getElementById('saveCaptionFilesBtn').disabled = !state.images.some(img => String(img.caption || '').trim());
+  updateCaptionSaveStatus();
 }
 
 function updateTokenCount() {
@@ -1837,12 +2189,27 @@ function updateTokenCount() {
   document.getElementById('tokenCount').textContent = `~${words} words`;
 }
 
+function updateCaptionSaveStatus() {
+  const el = document.getElementById('captionSaveStatus');
+  const img = state.images[state.activeIdx];
+  el.dataset.error = String(sessionSaveState === 'error' || img?.sidecarStatus === 'error');
+  el.textContent = !img ? 'Select an image to edit its caption.' :
+    sessionSaveState === 'error' ? 'Browser save failed. Export caption files to keep your edits.' :
+    sessionSaveState === 'saving' ? 'Saving in this browser…' :
+    img.sidecarStatus === 'error' ? 'Caption file save failed. Try Save caption files again.' :
+    img.sidecarStatus === 'saved' ? 'Saved in this browser and to .txt.' :
+    img.sidecarStatus === 'pending' ? 'Kept in this browser · .txt needs saving.' :
+    img.caption ? 'Kept in this browser.' : 'Ready for a caption.';
+}
+
 document.getElementById('captionOutput').addEventListener('input', () => {
-  if (state.activeIdx !== null) {
-    state.images[state.activeIdx].caption = document.getElementById('captionOutput').value;
-    if (state.images[state.activeIdx].sidecarStatus === 'saved') {
-      state.images[state.activeIdx].sidecarStatus = 'pending';
-    }
+  const img = state.images[state.activeIdx];
+  if (img) {
+    img.caption = document.getElementById('captionOutput').value;
+    img.editRevision = (img.editRevision || 0) + 1;
+    img.sidecarStatus = 'pending';
+    if (img.status !== 'running') img.status = img.caption.trim() ? 'done' : 'pending';
+    renderQueue();
     scheduleSaveSession();
   }
   updateTokenCount();
@@ -1852,7 +2219,7 @@ document.getElementById('captionOutput').addEventListener('input', () => {
 document.getElementById('captionOutput').addEventListener('change', async () => {
   if (state.activeIdx === null || !state.saveSidecars || !state.sidecarDirectory) return;
   const img = state.images[state.activeIdx];
-  if (!img || !img.caption) return;
+  if (!img) return;
   try {
     await writeSidecar(img);
     renderQueue();
@@ -1860,6 +2227,7 @@ document.getElementById('captionOutput').addEventListener('change', async () => 
   } catch(e) {
     img.sidecarStatus = 'error';
     renderQueue();
+    scheduleSaveSession();
     toast(`Could not update ${sidecarFilename(img.name)}: ${e.message}`, 'error-toast');
   }
 });
@@ -2007,7 +2375,7 @@ function normalizeWdHybridCaption(caption, trigger) {
 }
 
 function buildDirectCaptionPayload(imageB64, mediaType, systemPrompt) {
-  const cfg = readConnectionForm();
+  const cfg = state.config || {};
   const payload = {
     messages: [
       { role: 'system', content: systemPrompt },
@@ -2019,7 +2387,7 @@ function buildDirectCaptionPayload(imageB64, mediaType, systemPrompt) {
   };
   if (cfg.model) payload.model = cfg.model;
   ['temperature', 'top_p', 'max_tokens', 'top_k', 'presence_penalty'].forEach(key => {
-    if (cfg[key] !== null) payload[key] = cfg[key];
+    if (cfg[key] != null) payload[key] = cfg[key];
   });
   return { cfg, payload };
 }
@@ -2092,6 +2460,7 @@ function throwIfCaptioningStopped(signal) {
 }
 
 async function captionImage(img, signal) {
+  const editRevision = img.editRevision || 0;
   img.status = 'running';
   renderQueue();
   scheduleSaveSession();
@@ -2113,19 +2482,23 @@ async function captionImage(img, signal) {
     img.stage = 'captioning';
     renderQueue();
     const systemPrompt = renderCaptionerPrompt(state.activeOverride || '', trigger, context);
+    let generatedCaption;
     try {
-      img.caption = await captionViaBrowser(b64, mediaType, trigger, systemPrompt, signal);
+      generatedCaption = await captionViaBrowser(b64, mediaType, trigger, systemPrompt, signal);
     } catch(e) {
       if (!e.directUnavailable) throw e;
       throwIfCaptioningStopped(signal);
-      img.caption = await captionViaHub(b64, mediaType, trigger, systemPrompt, signal);
+      generatedCaption = await captionViaHub(b64, mediaType, trigger, systemPrompt, signal);
     }
     if (isWdHybridPreset()) {
-      img.caption = normalizeWdHybridCaption(img.caption, trigger);
+      generatedCaption = normalizeWdHybridCaption(generatedCaption, trigger);
     }
-    img.status = 'done';
+    if ((img.editRevision || 0) === editRevision) {
+      img.caption = generatedCaption;
+      img.sidecarStatus = '';
+    }
+    img.status = img.caption.trim() ? 'done' : 'pending';
     img.stage = '';
-    img.sidecarStatus = '';
     if (state.saveSidecars && state.sidecarDirectory) {
       try {
         await writeSidecar(img);
@@ -2136,7 +2509,7 @@ async function captionImage(img, signal) {
     }
   } catch (e) {
     const stopped = e?.name === 'AbortError' && signal?.aborted;
-    img.status = stopped ? 'pending' : 'error';
+    img.status = (img.editRevision || 0) !== editRevision && img.caption.trim() ? 'done' : (stopped ? 'pending' : 'error');
     img.stage = '';
     if (!stopped) {
       console.error(e);
@@ -2145,10 +2518,9 @@ async function captionImage(img, signal) {
   }
   renderQueue();
   scheduleSaveSession();
-  // Only refresh the textarea if it isn't being edited right now,
-  // so we don't clobber the user's in-flight changes.
+  // Manual edits win over a generation started before that edit.
   const ta = document.getElementById('captionOutput');
-  if (state.activeIdx === state.images.indexOf(img) && document.activeElement !== ta) {
+  if (state.activeIdx === state.images.indexOf(img) && ta.value !== img.caption) {
     ta.value = img.caption;
     updateTokenCount();
   }
@@ -2156,12 +2528,20 @@ async function captionImage(img, signal) {
 
 async function runOne() {
   if (state.activeIdx === null || state.running) return;
-  await prepareSidecarDirectory();
   const img = state.images[state.activeIdx];
-  document.getElementById('runOneBtn').disabled = true;
+  state.running = true;
+  state.stopRequested = false;
+  updateControls();
   try {
-    await captionImage(img);
+    await prepareSidecarDirectory();
+    if (state.stopRequested) return;
+    const controller = new AbortController();
+    state.activeRequestController = controller;
+    await captionImage(img, controller.signal);
   } finally {
+    state.activeRequestController = null;
+    state.running = false;
+    state.stopRequested = false;
     updateControls();
   }
 }
@@ -2172,11 +2552,11 @@ async function runCaptionBatch(images, completedMessage) {
     toast('All images already have captions', 'success');
     return;
   }
-  await prepareSidecarDirectory();
   state.running = true;
   state.stopRequested = false;
   updateControls();
   try {
+    await prepareSidecarDirectory();
     for (const img of images) {
       if (state.stopRequested) break;
       const controller = new AbortController();
@@ -2243,7 +2623,7 @@ function clearAll() {
   document.getElementById('tokenCount').textContent = '— words';
   document.getElementById('runOneBtn').disabled = true;
   updateControls();
-  clearSession();
+  scheduleSaveSession();
 }
 
 function copyCaption() {

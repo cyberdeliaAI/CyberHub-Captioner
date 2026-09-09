@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "product": "CyberHub",
+  "type": "system_prompt",
+  "module": "captioner",
+  "title": "Natural dataset caption",
+  "prompt": "Describe only what is visible in the image.\nBegin with {TRIGGER}.\nReturn the caption only."
+}
