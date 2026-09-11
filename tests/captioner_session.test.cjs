@@ -25,8 +25,8 @@ function harness() {
   const elements = new Map();
   const el = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   const context = vm.createContext({
-    console: {...console, warn() {}}, Blob, File, URL, AbortController, AbortSignal,
-    setTimeout: () => 1, clearTimeout() {}, setInterval() {},
+    console: {...console, warn() {}}, Blob, File, URL, TextEncoder, AbortController, AbortSignal,
+    setTimeout: (fn, delay) => delay === 0 ? setTimeout(fn, 0) : 1, clearTimeout() {}, setInterval() {},
     document: {getElementById: el, createElement: () => new Element(), querySelectorAll: () => [], addEventListener() {}},
     window: {addEventListener() {}}, navigator: {},
     localStorage: {getItem: () => null, setItem() {}},
@@ -339,4 +339,124 @@ test('failed settings save keeps the dialog and saved configuration intact', asy
   assert.equal(h.el('connectionDialog').open, true);
   assert.match(h.el('connectionFeedback').textContent, /Server unavailable/);
   assert.equal(h.state.connectionBusy, false);
+});
+
+// Validate generated archives with an independent ZIP reader, including CRCs.
+async function readDatasetArchive(blob) {
+  const {spawnSync} = require('node:child_process');
+  const python = `import base64, io, json, sys, zipfile
+with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as archive:
+    assert archive.testzip() is None
+    print(json.dumps([{'name': i.filename, 'data': base64.b64encode(archive.read(i)).decode(), 'method': i.compress_type, 'flags': i.flag_bits} for i in archive.infolist()]))
+`;
+  const result = spawnSync('python3', ['-B', '-c', python], {input:Buffer.from(await blob.arrayBuffer()), maxBuffer:20*1024*1024});
+  assert.equal(result.status, 0, result.stderr.toString());
+  return JSON.parse(result.stdout.toString()).map(entry => ({...entry, bytes:Buffer.from(entry.data, 'base64')}));
+}
+
+function captureDatasetDownload(h) {
+  let download;
+  h.context.downloadBlob = (filename, blob) => { download = {filename, blob}; };
+  h.context.toast = text => { h.context.lastToast = text; };
+  h.context.fetch = () => { throw new Error('Dataset export must not upload images'); };
+  h.context.window.showDirectoryPicker = () => { throw new Error('Dataset export must not request folder access'); };
+  return () => download;
+}
+
+test('dataset ZIP contains original image bytes and matching edited captions, skipping empty captions', async () => {
+  const h = harness(), downloaded = captureDatasetDownload(h);
+  const original = Uint8Array.from([0, 255, 2, 128, 10, 0, 239]);
+  h.img.file = new File([original], 'café.png', {type:'image/png'});
+  h.img.name = 'café.png';
+  h.edit('  My café caption.\nA second line.  ');
+  h.state.images.push({name:'café.jpg', file:new File(['other original'], 'café.jpg'), caption:'Second image'},
+    {name:'pending.png', file:new File(['not included'], 'pending.png'), caption:'  '});
+  h.context.supportsWritableFolders = () => true;
+  await h.run('exportDatasetZip()');
+  assert.equal(downloaded().filename, 'images-and-captions.zip');
+  assert.equal(downloaded().blob.type, 'application/zip');
+  const entries = await readDatasetArchive(downloaded().blob);
+  assert.deepEqual(entries.map(e => e.name), ['café.png','café.txt','café_2.jpg','café_2.txt']);
+  assert.deepEqual(entries[0].bytes, Buffer.from(original));
+  assert.equal(entries[1].bytes.toString(), 'My café caption.\nA second line.\n');
+  assert.equal(entries[2].bytes.toString(), 'other original');
+  assert.equal(entries[3].bytes.toString(), 'Second image\n');
+  assert.ok(entries.every(e => e.method === 0 && e.flags & 0x0800));
+  assert.equal(h.img.sidecarStatus, 'pending');
+});
+
+test('dataset names remain safe and pairs stay unique across folders, case and existing suffixes', async () => {
+  const h = harness();
+  h.state.images = ['../photo.png','folder\\PHOTO.jpg','photo_2.webp','CON.png','..','misnamed.txt','café.png','cafe\u0301.jpg'].map(name => ({name, file:new File(['original'],name),caption:'Caption'}));
+  const entries = await readDatasetArchive(await h.run('buildDatasetZip(datasetZipEntries(state.images))'));
+  const names = entries.map(e => e.name);
+  assert.equal(new Set(names.map(name => name.normalize('NFKC').toLowerCase())).size, names.length);
+  assert.ok(names.every(name => !/[\\/]/.test(name) && name !== '..'));
+  assert.ok(names.includes('_CON.png'));
+  for (let index = 0; index < names.length; index += 2) {
+    const image = names[index], dot = image.lastIndexOf('.');
+    assert.equal(names[index+1], (dot > 0 ? image.slice(0,dot) : image) + '.txt');
+  }
+});
+
+test('dataset ZIP keeps a consistent snapshot when captions change during export and blocks double clicks', async () => {
+  const h = harness(), downloaded = captureDatasetDownload(h);
+  let started, release;
+  const began = new Promise(resolve => {started=resolve;});
+  const gate = new Promise(resolve => {release=resolve;});
+  const originalSlice = h.img.file.slice.bind(h.img.file);
+  h.img.file.slice = (...args) => ({arrayBuffer: async () => {started(); await gate; return originalSlice(...args).arrayBuffer();}});
+  h.edit('Caption at click');
+  const first = h.run('exportDatasetZip()');
+  await began;
+  assert.equal(h.el('downloadDatasetBtn').disabled,true);
+  h.edit('Edited while preparing');
+  await h.run('exportDatasetZip()');
+  assert.equal(downloaded(),undefined);
+  release(); await first;
+  const entries = await readDatasetArchive(downloaded().blob);
+  assert.equal(entries[1].bytes.toString(),'Caption at click\n');
+  assert.equal(h.img.caption,'Edited while preparing');
+  assert.equal(h.state.datasetExportBusy,false);
+  assert.equal(h.el('downloadDatasetBtn').disabled,false);
+});
+
+test('dataset export fails without a partial download when any captioned original is missing or unreadable', async () => {
+  for (const failure of ['missing','unreadable']) {
+    const h = harness(), downloaded = captureDatasetDownload(h);
+    if (failure === 'missing') h.img.file = null;
+    else h.img.file.slice = () => ({arrayBuffer:async () => {throw new Error('File could not be read');}});
+    await h.run('exportDatasetZip()');
+    assert.equal(downloaded(),undefined);
+    assert.match(h.context.lastToast, failure === 'missing' ? /Original image unavailable/ : /could not be read/);
+    assert.equal(h.state.datasetExportBusy,false);
+    assert.equal(h.el('downloadDatasetBtn').disabled,false);
+  }
+});
+
+test('dataset export is disabled without nonempty captions and restores controls on failure', async () => {
+  const h = harness(), downloaded = captureDatasetDownload(h);
+  h.edit('  ');
+  assert.equal(h.el('downloadDatasetBtn').disabled,true);
+  await h.run('exportDatasetZip()');
+  assert.equal(downloaded(),undefined);
+  assert.match(h.context.lastToast,/No captioned images/);
+  assert.equal(h.state.datasetExportBusy,false);
+  assert.equal(h.el('downloadDatasetBtn').disabled,true);
+});
+
+test('oversized datasets are rejected before any image is read', async () => {
+  const h = harness();
+  h.context.largeEntries = [{name:'large.png',blob:{size:2*1024*1024*1024,slice(){throw new Error('Must not read');}}}];
+  await assert.rejects(h.run('buildDatasetZip(largeEntries)'), /2 GB/);
+  h.context.tooManyEntries = new Array(20002).fill({name:'image.png',blob:{size:1}});
+  await assert.rejects(h.run('buildDatasetZip(tooManyEntries)'), /10,000/);
+});
+
+test('ZIP CRCs and sizes remain valid for images spanning multiple read chunks', async () => {
+  const h = harness();
+  const bytes = Buffer.alloc(1024*1024+123, 0xa7);
+  h.img.file = new File([bytes], 'sample.png');
+  const entries = await readDatasetArchive(await h.run('buildDatasetZip(datasetZipEntries(state.images))'));
+  assert.deepEqual(entries[0].bytes, bytes);
 });

@@ -26,7 +26,7 @@ Output only the caption text."""
 
 class CaptionerModule(Module):
     name = "Captioner"
-    version = "1.6"
+    version = "1.6.1"
     release_stage = "stable"
     icon = "\U0001F4AC"   # 💬
     description = "Caption images using a local Vision Language Model"
@@ -1026,6 +1026,7 @@ PAGE_BODY = r"""
             <div class="cap-toolbar-right">
                 <button class="cap-btn" onclick="copyAll()">Copy all</button>
                 <button class="cap-btn primary" id="saveCaptionFilesBtn" disabled onclick="saveSidecarsNow()">Save caption files</button>
+                <button class="cap-btn" id="downloadDatasetBtn" disabled onclick="exportDatasetZip()" title="Download captioned images in their original format with matching .txt files">Download images + captions</button>
                 <button class="cap-btn" onclick="exportTxt()">Export .txt</button>
                 <button class="cap-btn" onclick="exportCsv()">Export .csv</button>
             </div>
@@ -1100,6 +1101,7 @@ const state = {
   activeOverride: '',
   autoTagger: { available: false, ready: false, runtimeReady: false },
   saveSidecars: true,
+  datasetExportBusy: false,
   sidecarDirectory: null,
   sidecarDirectoryName: ''
 };
@@ -2180,6 +2182,7 @@ function updateControls() {
   document.getElementById('runOneBtn').disabled = !has || state.activeIdx === null || state.running;
   document.getElementById('captionOutput').disabled = state.activeIdx === null;
   document.getElementById('saveCaptionFilesBtn').disabled = !state.images.some(img => String(img.caption || '').trim());
+  document.getElementById('downloadDatasetBtn').disabled = state.datasetExportBusy || !state.images.some(img => String(img.caption || '').trim());
   updateCaptionSaveStatus();
 }
 
@@ -2727,6 +2730,120 @@ async function exportSidecarsZip(done) {
     toast(`Exported ${done.length} caption files`, 'success');
   } catch(e) {
     toast(`Caption file export failed: ${e.message}`, 'error-toast');
+  }
+}
+
+// Keep dataset exports in the browser: reuse original File/Blob bytes without
+// uploading or re-encoding images. ZIP entries use STORE (method 0), UTF-8 names
+// and CRC-32; most supported image formats are already compressed.
+const DATASET_ZIP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const DATASET_CRC_TABLE = Uint32Array.from({length:256}, (_, n) => {
+  for (let bit = 0; bit < 8; bit++) n = n & 1 ? 0xedb88320 ^ (n >>> 1) : n >>> 1;
+  return n >>> 0;
+});
+
+function datasetZipEntries(images) {
+  const entries = [];
+  const used = new Set();
+  const key = name => name.normalize('NFKC').toLowerCase();
+  for (const img of images) {
+    const caption = String(img.caption || '').trim();
+    if (!caption) continue;
+    if (!(img.file instanceof Blob) || !img.file.size) throw new Error(`Original image unavailable: ${img.name}. Add it again before exporting.`);
+    const name = String(img.name || 'image').replace(/\\/g, '/').split('/').pop()
+      .replace(/[\x00-\x1f\x7f<>:"|?*]/g, '_').trim().replace(/[. ]+$/, '') || 'image';
+    const dot = name.lastIndexOf('.');
+    let stem = dot > 0 ? name.slice(0, dot) : name;
+    // A misnamed image must not collide with its own caption file.
+    const extension = dot > 0 ? (name.slice(dot).toLowerCase() === '.txt' ? '.image' : name.slice(dot)) : '';
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) stem = '_' + stem;
+    let unique = stem, suffix = 2;
+    while (used.has(key(unique + extension)) || used.has(key(unique + '.txt'))) unique = `${stem}_${suffix++}`;
+    for (const [filename, blob] of [[unique + extension, img.file], [unique + '.txt', new Blob([caption + '\n'], {type:'text/plain;charset=utf-8'})]]) {
+      used.add(key(filename));
+      entries.push({name:filename, blob});
+    }
+  }
+  return entries;
+}
+
+async function datasetCrc32(blob) {
+  let crc = 0xffffffff;
+  for (let offset = 0; offset < blob.size; offset += 1024 * 1024) {
+    const bytes = new Uint8Array(await blob.slice(offset, offset + 1024 * 1024).arrayBuffer());
+    for (const byte of bytes) crc = DATASET_CRC_TABLE[(crc ^ byte) & 255] ^ (crc >>> 8);
+    // Let the browser paint progress and keep the editor responsive on big files.
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+async function buildDatasetZip(entries, onProgress = () => {}) {
+  if (!entries.length) throw new Error('No captioned images to export');
+  if (entries.length > 20000) throw new Error('Export at most 10,000 captioned images at a time.');
+  const encoder = new TextEncoder();
+  const prepared = entries.map(entry => ({...entry, filename:encoder.encode(entry.name)}));
+  const totalSize = 22 + prepared.reduce((sum, entry) => sum + 76 + 2 * entry.filename.length + entry.blob.size, 0);
+  if (prepared.some(entry => entry.filename.length > 65535) || totalSize > DATASET_ZIP_MAX_BYTES) {
+    throw new Error('This ZIP exceeds the 2 GB export limit. Export a smaller batch.');
+  }
+  const parts = [], directory = [];
+  let offset = 0, completed = 0;
+  for (const entry of prepared) {
+    const crc = await datasetCrc32(entry.blob);
+    const size = entry.blob.size, nameLength = entry.filename.length;
+    const local = new Uint8Array(30 + nameLength), view = new DataView(local.buffer);
+    view.setUint32(0, 0x04034b50, true);
+    view.setUint16(4, 20, true); // ZIP 2.0
+    view.setUint16(6, 0x0800, true); // UTF-8
+    view.setUint16(12, 0x0021, true); // 1980-01-01; no synthetic image metadata
+    view.setUint32(14, crc, true);
+    view.setUint32(18, size, true);
+    view.setUint32(22, size, true);
+    view.setUint16(26, nameLength, true);
+    local.set(entry.filename, 30);
+    parts.push(local, entry.blob);
+    const central = new Uint8Array(46 + nameLength), index = new DataView(central.buffer);
+    index.setUint32(0, 0x02014b50, true);
+    index.setUint16(4, 20, true);
+    central.set(local.subarray(4, 30), 6);
+    index.setUint32(42, offset, true);
+    central.set(entry.filename, 46);
+    directory.push(central);
+    offset += local.length + size;
+    onProgress(++completed, prepared.length);
+  }
+  const end = new Uint8Array(22), footer = new DataView(end.buffer);
+  footer.setUint32(0, 0x06054b50, true);
+  footer.setUint16(8, prepared.length, true);
+  footer.setUint16(10, prepared.length, true);
+  footer.setUint32(12, directory.reduce((sum, item) => sum + item.length, 0), true);
+  footer.setUint32(16, offset, true);
+  return new Blob([...parts, ...directory, end], {type:'application/zip'});
+}
+
+async function exportDatasetZip() {
+  if (state.datasetExportBusy) return;
+  state.datasetExportBusy = true;
+  const button = document.getElementById('downloadDatasetBtn');
+  button.textContent = 'Preparing ZIP…';
+  updateControls();
+  try {
+    // Capture captions and image references once; ongoing edits or generation
+    // apply to the next export, never to half of an in-progress archive.
+    const entries = datasetZipEntries(state.images);
+    const zip = await buildDatasetZip(entries, (done, total) => {
+      button.textContent = `Preparing ZIP… ${Math.round(done / total * 100)}%`;
+    });
+    downloadBlob('images-and-captions.zip', zip);
+    const count = entries.length / 2;
+    toast(`Exported ${count} image${count === 1 ? '' : 's'} with matching caption files`, 'success');
+  } catch(e) {
+    toast(`Image and caption export failed: ${e.message}`, 'error-toast');
+  } finally {
+    state.datasetExportBusy = false;
+    button.textContent = 'Download images + captions';
+    updateControls();
   }
 }
 

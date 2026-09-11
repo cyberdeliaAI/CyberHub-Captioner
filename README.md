@@ -2,7 +2,7 @@
 
 Create local image captions with an OpenAI-compatible vision model.
 
-- Version: `1.6`
+- Version: `1.6.1`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -23,11 +23,15 @@ The ZIP attached to this repository's GitHub Release can also be imported manual
 
 CyberHub runs locally. A module uses an external service only when its function requires it and the user starts that action.
 
-## Captioner 1.6
+## Captioner 1.6.1
 
-This stable release introduces a reorganized workspace, a connection settings
-dialog, editable captions with session recovery, system-prompt JSON sharing,
-and saved-preset management with duplicate-name protection.
+Adds **Download images + captions**, a ZIP export of original captioned images
+and matching caption files, including manual edits. The export runs locally
+in the browser and keeps image/caption pairs together when names overlap.
+
+Captioner also includes a connection settings dialog, a dedicated image queue,
+editable captions with session recovery, system-prompt JSON sharing, and saved
+preset management with duplicate-name protection.
 
 ### Building a package
 
@@ -37,7 +41,7 @@ Build an installable ZIP directly from this repository:
 python3 tools/build_test_package.py --output /path/to/packages
 ```
 
-Import `cyberhub_module_captioner_v1.6.zip` through **Settings**, then restart
+Import `cyberhub_module_captioner_v1.6.1.zip` through **Settings**, then restart
 CyberHub. The ZIP contains only Captioner runtime files and its package
 manifest; it preserves user settings and the Library.
 
@@ -108,6 +112,21 @@ file per image; otherwise it downloads `caption-files.zip`. Explicit caption
 exports skip empty captions. Text is trimmed and files end with a newline.
 Copy, Library saves and bulk text/CSV exports use the edited captions too.
 
+**Download images + captions** always downloads `images-and-captions.zip`.
+It includes only images with nonempty captions and pairs each original image
+with a matching `.txt` file containing the caption at the start of the export.
+Image bytes, format, resolution and embedded metadata are preserved. Duplicate
+names (including the same stem with different image extensions) receive a
+shared numeric suffix for the image and its caption. Unsafe filename characters
+are replaced; no folder paths are included.
+
+The ZIP is built locally in the browser without uploading images. It supports
+up to 10,000 captioned images and a 2 GB ZIP; larger datasets must be exported
+in smaller batches. The button shows progress while preparing the download.
+If an original image is missing or cannot be read, the export reports an error
+instead of downloading an incomplete dataset. A dataset download does not mark
+caption files as saved beside the source images.
+
 When **Save .txt beside images** is enabled and folder access has been granted,
 leaving the caption editor also updates that image's `.txt` file. The queue and
 editor distinguish captions that need a file update from saved files. Folder
@@ -132,6 +151,9 @@ The tests cover edited caption exports, image switching, session records,
 storage failures, generation/edit races, file-write races, settings drafts,
 JSON round-trips, module/schema validation, prompt-only session restore, preset
 name conflicts, simultaneous saves, complete-list checks and scoped deletion.
+Dataset ZIP tests use Python's independent ZIP reader to verify original image
+bytes, edited captions, CRCs, Unicode names, duplicate-name pairing, export
+snapshots, missing images and size limits.
 Browser checks additionally cover the two dialog triggers, save/cancel,
 model detection, actual IndexedDB restore and responsive dark/light layouts.
 Model responses in the local preview were simulated; no live model is required
