@@ -2,7 +2,7 @@
 
 Create local image captions with an OpenAI-compatible vision model.
 
-- Version: `1.6.1`
+- Version: `1.7.0`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -23,6 +23,24 @@ The ZIP attached to this repository's GitHub Release can also be imported manual
 
 CyberHub runs locally. A module uses an external service only when its function requires it and the user starts that action.
 
+## Captioner 1.7.0
+
+The connection dialog now offers **Central connection** and **Own connection**.
+The central option uses **Settings → AI connection** in CyberHub 1.4.0 / Settings
+1.5.0, with an optional model override for Captioner. Empty model overrides
+inherit the central model; generation controls remain specific to Captioner.
+The next image request refreshes the saved connection, including central edits.
+
+Existing own connections are preserved. New setups without a saved URL inherit
+the central default once configured. Switching to central keeps the own server
+and model, so switching back can restore them. Older CyberHub versions still
+support own connections; no new Core import is required by this module.
+
+Central connections explicitly select the CyberHub or browser computer.
+`localhost` refers to the selected computer. Own connections additionally retain
+the existing browser-first, Hub-fallback option. Explicit browser mode never
+falls back to a different computer. Use a vision-capable model for captions.
+
 ## Captioner 1.6.1
 
 Adds **Download images + captions**, a ZIP export of original captioned images
@@ -41,7 +59,7 @@ Build an installable ZIP directly from this repository:
 python3 tools/build_test_package.py --output /path/to/packages
 ```
 
-Import `cyberhub_module_captioner_v1.6.1.zip` through **Settings**, then restart
+Import `cyberhub_module_captioner_v1.7.0.zip` through **Settings**, then restart
 CyberHub. The ZIP contains only Captioner runtime files and its package
 manifest; it preserves user settings and the Library.
 
@@ -49,14 +67,15 @@ manifest; it preserves user settings and the Library.
 
 - Open **Settings** at the top of Captioner, or click the **Connection** status
   in the left column. Both open the same settings dialog.
-- Set the API URL and optional model. URLs with or without `/v1` are accepted.
+- For an own connection, set the API URL and optional model. URLs with or without `/v1` are accepted.
   Empty model and generation fields use the server defaults.
 - **Detect model** fills in the first available model. **Save settings** applies
   the form. **Cancel**, Escape, or clicking outside the dialog discards edits.
   Clearing generation overrides also requires **Save settings**.
-- Detection tries the browser first, then CyberHub for the saved API URL. When
-  entering a different URL that the browser cannot reach directly, save it first
-  and retry detection through CyberHub.
+- Detection uses the selected connection location. Existing automatic own
+  connections try the browser, then CyberHub. With Core 1.4.0, Hub detection can
+  test an unsaved URL. On older Core, save a changed URL before detecting through
+  CyberHub. Detection itself never saves the form.
 - Input and Vision scripts occupy the first column. The adjacent narrow queue
   has its own scrollbar, image count, progress and batch controls. The image
   preview and caption editor fill the remaining space.

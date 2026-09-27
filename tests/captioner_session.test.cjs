@@ -460,3 +460,42 @@ test('ZIP CRCs and sizes remain valid for images spanning multiple read chunks',
   const entries = await readDatasetArchive(await h.run('buildDatasetZip(datasetZipEntries(state.images))'));
   assert.deepEqual(entries[0].bytes, bytes);
 });
+
+test('central mode inherits the model and preserves an own connection draft', () => {
+  const h = harness();
+  h.run(`state.config = {central_available:true, connection_mode:'shared', api_url:'http://shared/v1', model:'shared-model', transport:'hub', shared_model:'', shared:{configured:true,api_url:'http://shared/v1',model:'shared-model',transport:'hub'}, custom:{api_url:'http://own/v1',model:'own-model',transport:'auto'}}; populateConnectionForm(state.config);`);
+  assert.equal(h.el('capApiField').hidden, true);
+  assert.equal(h.el('capModel').value, '');
+  assert.equal(h.run('readConnectionForm().shared_model'), '');
+  assert.equal(h.run('readConnectionForm().model'), 'shared-model');
+  h.el('capConnectionMode').value = 'custom';
+  h.run('updateCaptionerConnectionMode()');
+  assert.equal(h.el('capApiUrl').value, 'http://own/v1');
+  assert.equal(h.el('capApiUrl').disabled, false);
+});
+
+test('central Hub detection never attempts the browser model server', async () => {
+  const h = harness();
+  const urls=[];
+  h.context.fetch=async (url,options)=>{urls.push(url);assert.equal(JSON.parse(options.body).api_url,'http://shared/v1');return {ok:true,json:async()=>({models:['vendor/full-model']})};};
+  const result=await h.run(`fetchCaptionerModels({central_available:true,connection_mode:'shared',transport:'hub',api_url:'http://shared/v1'})`);
+  assert.deepEqual(urls,['/api/ai/models']);assert.equal(result.models[0],'vendor/full-model');
+});
+
+test('explicit browser connection does not retry on a different computer', async () => {
+  const h = harness();
+  const urls=[];
+  h.context.fetch=async url=>{urls.push(url);throw new TypeError('Browser unavailable');};
+  await assert.rejects(h.run(`fetchCaptionerModels({central_available:true,transport:'browser',api_url:'http://shared/v1'})`),/Browser unavailable/);
+  assert.deepEqual(urls,['http://shared/v1/models']);
+});
+
+test('central config changes apply before the next caption and failures remain visible', async () => {
+  const h = harness();
+  h.run('state.config.central_available=true');
+  h.context.fetch=async()=>({ok:true,json:async()=>({central_available:true,connection_mode:'shared',api_url:'http://new/v1',model:'new-model',transport:'hub'})});
+  await h.run('refreshCaptionerConnection()');
+  assert.equal(h.state.config.model,'new-model');
+  h.context.fetch=async()=>({ok:true,json:async()=>({connection_error:'Save central settings first'})});
+  await assert.rejects(h.run('refreshCaptionerConnection()'),/Save central settings first/);
+});

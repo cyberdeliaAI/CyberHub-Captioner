@@ -26,7 +26,7 @@ Output only the caption text."""
 
 class CaptionerModule(Module):
     name = "Captioner"
-    version = "1.6.1"
+    version = "1.7.0"
     release_stage = "stable"
     icon = "\U0001F4AC"   # 💬
     description = "Caption images using a local Vision Language Model"
@@ -163,7 +163,7 @@ class CaptionerModule(Module):
         max_tokens = self._optional_number(self.setting("max_tokens"), integer=True)
         top_k = self._optional_number(self.setting("top_k"), integer=True)
         presence_penalty = self._optional_number(self.setting("presence_penalty"))
-        return {
+        cfg = {
             "api_url": self._normalize_api_url(self.setting("api_url")),
             "model": self.setting("model") or "",
             "system_prompt": DEFAULT_SYSTEM_PROMPT,
@@ -172,7 +172,14 @@ class CaptionerModule(Module):
             "max_tokens": max_tokens,
             "top_k": top_k,
             "presence_penalty": presence_penalty,
+            "transport": self.setting("transport") or "auto",
+            "central_available": False,
+            "connection_mode": "custom",
         }
+        service = getattr(self.hub, "ai_connection", None)
+        if service is not None:
+            cfg.update(service.resolve("captioner", legacy_transport="auto"))
+        return cfg
 
     @staticmethod
     def _normalize_api_url(value):
@@ -230,18 +237,42 @@ class CaptionerModule(Module):
 
     def _save_config(self, handler, content_len, content_type):
         data = handler.read_body_json(content_len)
-        if data is None:
-            handler.respond_json({"error": "Invalid JSON"}, status=400); return
-        for key in ("api_url", "model", "temperature", "top_p", "max_tokens",
-                    "top_k", "presence_penalty"):
-            if key in data:
-                value = data[key]
-                if key == "api_url":
-                    value = self._normalize_api_url(value)
-                elif key in ("temperature", "top_p", "max_tokens", "top_k", "presence_penalty"):
-                    value = "" if value is None or str(value).strip() == "" else value
-                self.hub.settings.set_module_setting("captioner", key, value)
-        handler.respond_json({"ok": True})
+        if not isinstance(data, dict):
+            handler.respond_json({"error": "Invalid JSON"}, status=400)
+            return
+        try:
+            # Preserve the existing endpoint's partial-update behavior.
+            connection = {"api_url": self.setting("api_url") or "http://localhost:1234/v1",
+                          "model": self.setting("model") or "",
+                          "transport": self.setting("transport") or "auto",
+                          "connection_mode": self.setting("connection_mode") or "custom",
+                          "shared_model": self.setting("shared_model") or ""}
+            connection.update(data)
+            service = getattr(self.hub, "ai_connection", None)
+            if service is not None:
+                values = service.module_values(connection, legacy_transport="auto")
+            else:
+                if connection["connection_mode"] != "custom":
+                    raise ValueError("Update CyberHub to use the central connection. Your own connection remains available.")
+                transport = connection["transport"]
+                if transport not in {"auto", "hub", "browser"}:
+                    raise ValueError("Invalid connection location.")
+                values = {"api_url": self._normalize_api_url(connection["api_url"]),
+                          "model": str(connection["model"] or "").strip(),
+                          "transport": transport, "connection_mode": "custom"}
+            for key in ("temperature", "top_p", "max_tokens", "top_k", "presence_penalty"):
+                if key in data:
+                    value = data[key]
+                    values[key] = "" if value is None or str(value).strip() == "" else value
+            store = self.hub.settings
+            if hasattr(store, "set_module_settings"):
+                store.set_module_settings("captioner", values)
+            else:
+                for key, value in values.items():
+                    store.set_module_setting("captioner", key, value)
+            handler.respond_json({"ok": True, "config": self._get_cfg()})
+        except ValueError as exc:
+            handler.respond_json({"error": str(exc)}, status=400)
 
     def _get_models(self, handler, qs):
         import requests
@@ -273,6 +304,9 @@ class CaptionerModule(Module):
         image_b64 = data.get("image_b64")
         if not image_b64: handler.respond_json({"error": "No image provided"}, status=400); return
         cfg = self._get_cfg()
+        if cfg.get("connection_error"):
+            handler.respond_json({"error": cfg["connection_error"]}, status=400)
+            return
         media_type = data.get("media_type", "image/jpeg")
         override = (data.get("override_prompt") or "").strip()
         system_prompt, trigger = self._render_trigger_prompt(
@@ -776,6 +810,9 @@ PAGE_BODY = r"""
 .cap-workspace-header h1 { font-size:18px; font-weight:600; letter-spacing:-.3px; color:var(--text-bright); line-height:1.3; }
 .cap-workspace-header p { margin-top:3px; font-size:12px; color:var(--text-dim); }
 .cap-settings-link { display:inline-flex; align-items:center; gap:8px; background:none; border:0; color:var(--accent); font:inherit; cursor:pointer; padding:8px 0 8px 12px; }
+#capCentralLink { color:var(--accent); font-size:12px; }
+#capApiField[hidden], #capTransportField[hidden] { display:none; }
+#capConnectionNote { overflow-wrap:anywhere; }
 .cap-settings-link:hover { color:var(--text-bright); text-decoration:underline; }
 .cap-app :is(button, select, input, textarea):focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
 .cap-connection-section { padding:12px; }
@@ -1040,12 +1077,23 @@ PAGE_BODY = r"""
         <div class="cap-dialog-body">
             <div class="cap-settings-section"><h3>Connection</h3><p>Use a server with a vision-capable model loaded.</p></div>
                 <div class="cap-field">
+                    <label for="capConnectionMode">Connection source</label>
+                    <select class="cap-input" id="capConnectionMode" onchange="updateCaptionerConnectionMode()"><option value="custom">Own connection</option><option value="shared">Central connection</option></select>
+                    <div class="cap-field-note" id="capConnectionNote"></div>
+                    <a href="/settings#ai-connection" id="capCentralLink">Manage central AI connection</a>
+                </div>
+                <div class="cap-field" id="capApiField">
                     <label for="capApiUrl">API URL</label>
                     <input class="cap-input" id="capApiUrl" type="text" required spellcheck="false" placeholder="http://localhost:1234">
                     <div class="cap-field-note">Your LM Studio or OpenAI-compatible server. With or without <code>/v1</code>.</div>
                 </div>
+                <div class="cap-field" id="capTransportField">
+                    <label for="capTransport">Connect from</label>
+                    <select class="cap-input" id="capTransport"><option value="auto">Browser, then CyberHub (existing behavior)</option><option value="hub">CyberHub computer</option><option value="browser">Browser computer</option></select>
+                    <div class="cap-field-note">localhost refers to the selected computer.</div>
+                </div>
                 <div class="cap-field">
-                    <label for="capModel">Model</label>
+                    <label for="capModel">Model override for Captioner</label>
                     <input class="cap-input" id="capModel" type="text" spellcheck="false" placeholder="LM Studio default">
                 </div>
                 <div class="cap-settings-section"><h3>Generation overrides</h3><p>Leave fields empty to use the server defaults.</p></div>
@@ -1332,11 +1380,37 @@ async function init() {
 }
 
 function populateConnectionForm(cfg) {
+  const mode = document.getElementById('capConnectionMode');
+  mode.value = cfg.connection_mode || 'custom';
+  mode.disabled = !cfg.central_available;
+  document.getElementById('capCentralLink').hidden = !cfg.central_available;
   document.getElementById('capApiUrl').value = cfg.api_url || 'http://localhost:1234/v1';
-  document.getElementById('capModel').value = cfg.model || '';
+  document.getElementById('capTransport').value = cfg.transport || 'auto';
+  document.getElementById('capModel').value = mode.value === 'shared' ? cfg.shared_model || '' : cfg.model || '';
+  updateCaptionerConnectionMode(false);
   for (const [key, id] of Object.entries({ temperature: 'capTemperature', top_p: 'capTopP', max_tokens: 'capMaxTokens', top_k: 'capTopK', presence_penalty: 'capPresencePenalty' })) {
     document.getElementById(id).value = cfg[key] ?? '';
   }
+}
+
+function updateCaptionerConnectionMode(switched=true) {
+  const cfg = state.config || {};
+  const shared = document.getElementById('capConnectionMode').value === 'shared';
+  const values = shared ? cfg.shared || {} : cfg.custom || cfg;
+  if (switched) {
+    document.getElementById('capApiUrl').value = values.api_url || 'http://localhost:1234/v1';
+    document.getElementById('capTransport').value = values.transport || 'auto';
+    document.getElementById('capModel').value = shared ? cfg.shared_model || '' : values.model || '';
+  }
+  document.getElementById('capApiField').hidden = shared;
+  document.getElementById('capTransportField').hidden = shared;
+  document.getElementById('capApiUrl').disabled = shared;
+  document.getElementById('capTransport').disabled = shared;
+  document.getElementById('capModel').placeholder = shared ? (cfg.shared?.model || 'Central / server default') : 'Server default';
+  document.getElementById('capConnectionNote').textContent = !cfg.central_available
+    ? 'Own connection is available. Update CyberHub to enable central settings.'
+    : shared ? (cfg.shared?.configured ? 'Uses ' + cfg.shared.api_url + ' via the ' + (cfg.shared.transport === 'hub' ? 'CyberHub' : 'browser') + ' computer. Leave the model empty to inherit its default.' : 'Save a central AI connection in Settings first.')
+    : 'Only Captioner uses this connection. Switching to central preserves it.';
 }
 
 function connectionFeedback(message='', error=false) {
@@ -1361,7 +1435,7 @@ function openConnectionSettings() {
   populateConnectionForm(state.config || {});
   connectionFeedback();
   document.getElementById('connectionDialog').showModal();
-  document.getElementById('capApiUrl').focus();
+  document.getElementById(state.config?.connection_mode === 'shared' ? 'capModel' : 'capApiUrl').focus();
 }
 
 function closeConnectionSettings() {
@@ -1370,7 +1444,11 @@ function closeConnectionSettings() {
 
 function setConnectionBusy(busy) {
   state.connectionBusy = busy;
-  document.querySelectorAll('#connectionForm button, #connectionForm input').forEach(el => { el.disabled = busy; });
+  document.querySelectorAll('#connectionForm button, #connectionForm input, #connectionForm select').forEach(el => { el.disabled = busy; });
+  if (!busy) {
+    document.getElementById('capConnectionMode').disabled = !state.config?.central_available;
+    updateCaptionerConnectionMode(false);
+  }
 }
 
 async function loadConnectionConfig() {
@@ -1403,9 +1481,15 @@ function optionalFormNumber(id, integer=false) {
 function readConnectionForm() {
   const apiUrl = normalizeCaptionerApiUrl(document.getElementById('capApiUrl').value);
   document.getElementById('capApiUrl').value = apiUrl;
+  const shared = document.getElementById('capConnectionMode').value === 'shared';
+  const model = (document.getElementById('capModel').value || '').trim();
   return {
-    api_url: apiUrl,
-    model: (document.getElementById('capModel').value || '').trim(),
+    central_available: !!state.config?.central_available,
+    connection_mode: shared ? 'shared' : 'custom',
+    shared_model: shared ? model : '',
+    transport: shared ? state.config?.shared?.transport || 'hub' : document.getElementById('capTransport').value || 'auto',
+    api_url: shared ? state.config?.shared?.api_url || '' : apiUrl,
+    model: shared ? model || state.config?.shared?.model || '' : model,
     temperature: optionalFormNumber('capTemperature'),
     top_p: optionalFormNumber('capTopP'),
     max_tokens: optionalFormNumber('capMaxTokens', true),
@@ -1433,7 +1517,7 @@ async function saveConnectionConfig() {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.error) throw new Error(data.error || 'Save failed');
-    state.config = cfg;
+    state.config = data.config || cfg;
     document.getElementById('connectionDialog').close();
     toast('Captioner settings saved', 'success');
     checkConnection();
@@ -1464,8 +1548,10 @@ async function detectCaptionerModel() {
 }
 
 async function fetchCaptionerModels(cfg=state.config || {}) {
+  if (cfg.connection_error || (cfg.connection_mode === 'shared' && !cfg.api_url)) throw new Error(cfg.connection_error || 'Save a central connection in Settings first.');
   let directError = null;
   try {
+    if (cfg.transport === 'hub') throw new Error('Use CyberHub');
     const r = await fetch(normalizeCaptionerApiUrl(cfg.api_url) + '/models', { signal: AbortSignal.timeout(5000) });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error?.message || data.error || `HTTP ${r.status}`);
@@ -1474,6 +1560,13 @@ async function fetchCaptionerModels(cfg=state.config || {}) {
     return { models, via: 'browser' };
   } catch(e) {
     directError = e;
+    if (cfg.transport === 'browser') throw e;
+  }
+  if (cfg.central_available) {
+    const response = await fetch('/api/ai/models', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...cfg, transport:'hub'})});
+    const data = await response.json();
+    if (!response.ok || data.error || !data.models?.length) throw new Error(data.error || 'No models found');
+    return {models:data.models, via:'hub'};
   }
 
   if (normalizeCaptionerApiUrl(cfg.api_url) !== normalizeCaptionerApiUrl(state.config?.api_url)) {
@@ -1921,6 +2014,7 @@ async function checkConnection() {
   const dot = document.getElementById('statusDot');
   const lbl = document.getElementById('statusLabel');
   try {
+    await refreshCaptionerConnection();
     const data = await fetchCaptionerModels();
     const count = data.models.length;
     dot.className = 'cap-status-dot connected';
@@ -2462,6 +2556,15 @@ function throwIfCaptioningStopped(signal) {
   if (signal?.aborted) throw new DOMException('Captioning stopped', 'AbortError');
 }
 
+async function refreshCaptionerConnection() {
+  if (!state.config?.central_available) return;
+  const response = await fetch('/api/captioner/config', {cache:'no-store'});
+  if (!response.ok) throw new Error('Could not refresh the AI connection.');
+  const cfg = await response.json();
+  if (cfg.connection_error) throw new Error(cfg.connection_error);
+  state.config = cfg;
+}
+
 async function captionImage(img, signal) {
   const editRevision = img.editRevision || 0;
   img.status = 'running';
@@ -2469,6 +2572,7 @@ async function captionImage(img, signal) {
   scheduleSaveSession();
   try {
     throwIfCaptioningStopped(signal);
+    await refreshCaptionerConnection();
     const b64 = await fileToBase64(img.file);
     throwIfCaptioningStopped(signal);
     const mediaType = img.file.type || 'image/jpeg';
@@ -2487,9 +2591,13 @@ async function captionImage(img, signal) {
     const systemPrompt = renderCaptionerPrompt(state.activeOverride || '', trigger, context);
     let generatedCaption;
     try {
-      generatedCaption = await captionViaBrowser(b64, mediaType, trigger, systemPrompt, signal);
+      if (state.config?.transport === 'hub') {
+        generatedCaption = await captionViaHub(b64, mediaType, trigger, systemPrompt, signal);
+      } else {
+        generatedCaption = await captionViaBrowser(b64, mediaType, trigger, systemPrompt, signal);
+      }
     } catch(e) {
-      if (!e.directUnavailable) throw e;
+      if (!e.directUnavailable || state.config?.transport === 'browser') throw e;
       throwIfCaptioningStopped(signal);
       generatedCaption = await captionViaHub(b64, mediaType, trigger, systemPrompt, signal);
     }
