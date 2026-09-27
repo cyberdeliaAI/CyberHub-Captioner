@@ -2,7 +2,7 @@
 
 Create local image captions with an OpenAI-compatible vision model.
 
-- Version: `1.7.0`
+- Version: `1.7.1`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -41,6 +41,22 @@ Central connections explicitly select the CyberHub or browser computer.
 the existing browser-first, Hub-fallback option. Explicit browser mode never
 falls back to a different computer. Use a vision-capable model for captions.
 
+## API keys (1.7.1)
+
+The central connection inherits the API key saved in Settings. An own connection
+has its own optional **API key** field, for example for oMLX authentication.
+Leave it blank to keep the saved key; select **Remove saved API key** to delete it.
+Changing the server address clears the old key unless you enter a new one.
+Model detection and generation use the same key, including browser connections.
+Keys are stored locally in CyberHub's `settings.json`, not in browser preferences.
+A direct browser connection receives the key only when it needs to contact the server.
+
+API-key support is included in 1.7.1. Update through **Module Manager → Check
+for updates**, then restart. For a central API key, also install the revised
+CyberHub 1.4.0 package. If Core 1.4.0 is already installed, reimport its current
+ZIP through **Settings → Maintenance → Import update or module ZIP**, because
+Core's version number remains unchanged.
+
 ## Captioner 1.6.1
 
 Adds **Download images + captions**, a ZIP export of original captioned images
@@ -59,7 +75,7 @@ Build an installable ZIP directly from this repository:
 python3 tools/build_test_package.py --output /path/to/packages
 ```
 
-Import `cyberhub_module_captioner_v1.7.0.zip` through **Settings**, then restart
+Import `cyberhub_module_captioner_v1.7.1.zip` through **Settings**, then restart
 CyberHub. The ZIP contains only Captioner runtime files and its package
 manifest; it preserves user settings and the Library.
 
@@ -73,9 +89,8 @@ manifest; it preserves user settings and the Library.
   the form. **Cancel**, Escape, or clicking outside the dialog discards edits.
   Clearing generation overrides also requires **Save settings**.
 - Detection uses the selected connection location. Existing automatic own
-  connections try the browser, then CyberHub. With Core 1.4.0, Hub detection can
-  test an unsaved URL. On older Core, save a changed URL before detecting through
-  CyberHub. Detection itself never saves the form.
+  connections try the browser, then CyberHub. Hub detection can test an unsaved
+  URL and API key without changing the saved connection. Detection itself never saves the form.
 - Input and Vision scripts occupy the first column. The adjacent narrow queue
   has its own scrollbar, image count, progress and batch controls. The image
   preview and caption editor fill the remaining space.

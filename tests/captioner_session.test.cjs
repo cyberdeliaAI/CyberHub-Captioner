@@ -479,7 +479,7 @@ test('central Hub detection never attempts the browser model server', async () =
   const urls=[];
   h.context.fetch=async (url,options)=>{urls.push(url);assert.equal(JSON.parse(options.body).api_url,'http://shared/v1');return {ok:true,json:async()=>({models:['vendor/full-model']})};};
   const result=await h.run(`fetchCaptionerModels({central_available:true,connection_mode:'shared',transport:'hub',api_url:'http://shared/v1'})`);
-  assert.deepEqual(urls,['/api/ai/models']);assert.equal(result.models[0],'vendor/full-model');
+  assert.deepEqual(urls,['/api/captioner/models']);assert.equal(result.models[0],'vendor/full-model');
 });
 
 test('explicit browser connection does not retry on a different computer', async () => {
@@ -498,4 +498,28 @@ test('central config changes apply before the next caption and failures remain v
   assert.equal(h.state.config.model,'new-model');
   h.context.fetch=async()=>({ok:true,json:async()=>({connection_error:'Save central settings first'})});
   await assert.rejects(h.run('refreshCaptionerConnection()'),/Save central settings first/);
+});
+
+
+test('API-key controls keep saved secrets out of the form and support explicit removal',()=>{
+ const h=harness();h.state.config={api_url:'http://own/v1',transport:'hub',api_key_set:true,connection_mode:'custom'};
+ h.run('populateConnectionForm(state.config)');
+ assert.equal(h.el('capApiKey').value,'');assert.match(h.el('capApiKey').placeholder,/saved/);
+ assert.equal(Object.hasOwn(h.run('readConnectionForm()'),'api_key'),false);
+ h.el('capApiKey').value='new-secret';assert.equal(h.run('readConnectionForm().api_key'),'new-secret');
+ h.el('capClearApiKey').checked=true;assert.equal(h.run('readConnectionForm().api_key'),'');
+});
+test('browser caption retries carry the saved key only to the saved model endpoint',async()=>{
+ const h=harness();h.state.config={api_url:'http://own/v1',api_key_set:true,transport:'browser'};
+ h.el('capApiKey').value='unsaved-secret';const calls=[];
+ h.context.fetch=async(url,opts)=>{calls.push({url,opts});if(url.endsWith('/browser-connection'))return {ok:true,json:async()=>({api_url:'http://own/v1',api_key:'saved-secret'})};
+ return calls.length===2?{ok:false,text:async()=> 'unsupported top_k'}:{ok:true,json:async()=>({choices:[{message:{content:'Caption'}}]})};};
+ await h.run('captionViaBrowser("data","image/png","","Describe",new AbortController().signal)');
+ assert.equal(calls[0].url,'/api/captioner/browser-connection');assert.equal(JSON.parse(calls[0].opts.body).saved,true);
+ for(const call of calls.slice(1)){assert.equal(call.url,'http://own/v1/chat/completions');assert.equal(call.opts.headers.Authorization,'Bearer saved-secret');assert.equal(call.opts.redirect,'error');}
+ assert.equal(calls.length,3);assert.equal(h.state.config.api_key,undefined);
+});
+test('browser key never follows a connection change to another server',async()=>{
+ const h=harness();h.context.fetch=async()=>({ok:true,json:async()=>({api_url:'http://changed/v1',api_key:'secret'})});
+ await assert.rejects(h.run('captionerBrowserHeaders({api_url:"http://old/v1",api_key_set:true},true)'),/Connection changed/);
 });

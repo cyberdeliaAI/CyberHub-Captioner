@@ -6,6 +6,50 @@ import re
 import threading
 import unicodedata
 from core import Module
+
+# These small helpers also support installations predating Core AI settings.
+try:
+    from core.ai_connection import api_key_value, auth_headers, public_connection
+except ImportError:
+    def api_key_value(data, previous=None):
+        """Omitted keys survive edits only for the same normalized endpoint."""
+        if "api_key" in data:
+            value = data["api_key"]
+            if not isinstance(value, str) or len(value) > 4096:
+                raise ValueError("Invalid API key.")
+            value = value.strip()
+            if any(ord(c) < 33 or ord(c) > 126 for c in value):
+                raise ValueError("API keys cannot contain spaces or control characters.")
+            return value
+        previous = previous or {}
+        def endpoint(value):
+            value = str(value or "").strip().rstrip("/")
+            if value and "://" not in value:
+                value = "http://" + value
+            if value and not value.lower().endswith("/v1"):
+                value += "/v1"
+            return value
+        if endpoint(data.get("api_url")) == endpoint(previous.get("api_url")):
+            return api_key_value({"api_key": previous.get("api_key", "")})
+        return ""
+
+
+    def auth_headers(connection):
+        key = api_key_value({"api_key": connection.get("api_key", "")})
+        return {"Authorization": "Bearer " + key} if key else {}
+
+
+    def public_connection(value):
+        """Keep credentials out of config responses, including custom/shared backups."""
+        if isinstance(value, list):
+            return [public_connection(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {key: public_connection(item) for key, item in value.items() if key != "api_key"}
+        if "api_key" in value:
+            result["api_key_set"] = bool(value["api_key"])
+        return result
+
 from core.server import build_shell
 
 DEFAULT_USER_INSTRUCTION = "Caption this image according to the system instructions."
@@ -26,7 +70,7 @@ Output only the caption text."""
 
 class CaptionerModule(Module):
     name = "Captioner"
-    version = "1.7.0"
+    version = "1.7.1"
     release_stage = "stable"
     icon = "\U0001F4AC"   # 💬
     description = "Caption images using a local Vision Language Model"
@@ -47,6 +91,8 @@ class CaptionerModule(Module):
     def routes_post(self):
         return {
             "/api/captioner/config": self._save_config,
+            "/api/captioner/models": self._models,
+            "/api/captioner/browser-connection": self._browser_connection,
             "/api/captioner/caption": self._caption,
             "/api/captioner/sidecars": self._sidecars,
             "/api/captioner/presets/save": self._save_preset,
@@ -166,6 +212,7 @@ class CaptionerModule(Module):
         cfg = {
             "api_url": self._normalize_api_url(self.setting("api_url")),
             "model": self.setting("model") or "",
+            "api_key": self.setting("api_key") or "",
             "system_prompt": DEFAULT_SYSTEM_PROMPT,
             "temperature": temperature,
             "top_p": top_p,
@@ -179,6 +226,9 @@ class CaptionerModule(Module):
         service = getattr(self.hub, "ai_connection", None)
         if service is not None:
             cfg.update(service.resolve("captioner", legacy_transport="auto"))
+            cfg.get("custom", {})["api_key"] = self.setting("api_key") or ""
+            if cfg["connection_mode"] == "shared":
+                cfg["api_key"] = service.shared().get("api_key", "")
         return cfg
 
     @staticmethod
@@ -232,8 +282,69 @@ class CaptionerModule(Module):
             active_key="captioner", page_title="Captioner", body_html=PAGE_BODY)
         handler.respond_html(html)
 
+    def _browser_connection(self, handler, content_len, content_type):
+        try:
+            data = handler.read_body_json(content_len)
+            if not isinstance(data, dict):
+                raise ValueError("Expected connection settings.")
+            cfg = self._get_cfg() if data.get("saved") is True else self._draft_connection(data)
+            if cfg.get("connection_error"):
+                raise ValueError(cfg["connection_error"])
+            if cfg.get("transport") not in {"browser", "auto"}:
+                raise ValueError("This connection uses the CyberHub computer.")
+            # The explicit browser request needs this key; ordinary config never does.
+            handler.respond_json({"api_url": cfg["api_url"], "api_key": cfg.get("api_key", "")})
+        except ValueError as exc:
+            handler.respond_json({"error": str(exc)}, status=400)
+
     def _get_config(self, handler, qs):
-        handler.respond_json(self._get_cfg())
+        handler.respond_json(public_connection(self._get_cfg()))
+
+    def _connection_values(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Expected connection settings.")
+        # Preserve the existing endpoint's partial-update behavior.
+        connection = {"api_url": self.setting("api_url") or "http://localhost:1234/v1",
+                      "model": self.setting("model") or "",
+                      "transport": self.setting("transport") or "auto",
+                      "connection_mode": self.setting("connection_mode") or "custom",
+                      "shared_model": self.setting("shared_model") or ""}
+        connection.update(data)
+        connection["api_key"] = api_key_value(data if "api_url" in data else {**data, "api_url": connection["api_url"]}, self.hub.settings.get_module("captioner"))
+        service = getattr(self.hub, "ai_connection", None)
+        if service is not None:
+            values = service.module_values(connection, legacy_transport="auto")
+        else:
+            if connection["connection_mode"] != "custom":
+                raise ValueError("Update CyberHub to use the central connection. Your own connection remains available.")
+            transport = connection["transport"]
+            if transport not in {"auto", "hub", "browser"}:
+                raise ValueError("Invalid connection location.")
+            values = {"api_url": self._normalize_api_url(connection["api_url"]),
+                      "model": str(connection["model"] or "").strip(),
+                      "transport": transport, "connection_mode": "custom"}
+
+        if values["connection_mode"] == "custom":
+            values["api_key"] = connection["api_key"]
+        return values
+
+    def _draft_connection(self, data):
+        values = self._connection_values(data)
+        if values["connection_mode"] == "shared":
+            return self.hub.ai_connection.shared()
+        return values
+
+    def _models(self, handler, content_len, content_type):
+        import requests
+        try:
+            cfg = self._draft_connection(handler.read_body_json(content_len))
+            response = requests.get(cfg["api_url"] + "/models", headers=auth_headers(cfg), timeout=8, allow_redirects=False)
+            response.raise_for_status()
+            handler.respond_json({"models": [m["id"] for m in response.json().get("data", [])]})
+        except ValueError as exc:
+            handler.respond_json({"error": str(exc)}, status=400)
+        except requests.RequestException as exc:
+            handler.respond_json({"error": str(exc), "models": []}, status=503)
 
     def _save_config(self, handler, content_len, content_type):
         data = handler.read_body_json(content_len)
@@ -241,25 +352,7 @@ class CaptionerModule(Module):
             handler.respond_json({"error": "Invalid JSON"}, status=400)
             return
         try:
-            # Preserve the existing endpoint's partial-update behavior.
-            connection = {"api_url": self.setting("api_url") or "http://localhost:1234/v1",
-                          "model": self.setting("model") or "",
-                          "transport": self.setting("transport") or "auto",
-                          "connection_mode": self.setting("connection_mode") or "custom",
-                          "shared_model": self.setting("shared_model") or ""}
-            connection.update(data)
-            service = getattr(self.hub, "ai_connection", None)
-            if service is not None:
-                values = service.module_values(connection, legacy_transport="auto")
-            else:
-                if connection["connection_mode"] != "custom":
-                    raise ValueError("Update CyberHub to use the central connection. Your own connection remains available.")
-                transport = connection["transport"]
-                if transport not in {"auto", "hub", "browser"}:
-                    raise ValueError("Invalid connection location.")
-                values = {"api_url": self._normalize_api_url(connection["api_url"]),
-                          "model": str(connection["model"] or "").strip(),
-                          "transport": transport, "connection_mode": "custom"}
+            values = self._connection_values(data)
             for key in ("temperature", "top_p", "max_tokens", "top_k", "presence_penalty"):
                 if key in data:
                     value = data[key]
@@ -270,7 +363,7 @@ class CaptionerModule(Module):
             else:
                 for key, value in values.items():
                     store.set_module_setting("captioner", key, value)
-            handler.respond_json({"ok": True, "config": self._get_cfg()})
+            handler.respond_json({"ok": True, "config": public_connection(self._get_cfg())})
         except ValueError as exc:
             handler.respond_json({"error": str(exc)}, status=400)
 
@@ -278,7 +371,7 @@ class CaptionerModule(Module):
         import requests
         cfg = self._get_cfg()
         try:
-            resp = requests.get(f"{cfg['api_url']}/models", timeout=5)
+            resp = requests.get(f"{cfg['api_url']}/models", timeout=5, headers=auth_headers(cfg), allow_redirects=False)
             resp.raise_for_status()
             models = [m["id"] for m in resp.json().get("data", [])]
             handler.respond_json({"models": models})
@@ -289,7 +382,7 @@ class CaptionerModule(Module):
         import requests
         cfg = self._get_cfg()
         try:
-            resp = requests.get(f"{cfg['api_url']}/models", timeout=3)
+            resp = requests.get(f"{cfg['api_url']}/models", timeout=3, headers=auth_headers(cfg), allow_redirects=False)
             resp.raise_for_status()
             models = resp.json().get("data", [])
             if not models: handler.respond_json({"ok": False, "reason": "no_models"}, status=503); return
@@ -327,7 +420,7 @@ class CaptionerModule(Module):
             if cfg[key] is not None:
                 payload[key] = cfg[key]
         try:
-            resp = requests.post(f"{cfg['api_url']}/chat/completions", json=payload, timeout=120)
+            resp = requests.post(f"{cfg['api_url']}/chat/completions", json=payload, timeout=120, headers=auth_headers(cfg), allow_redirects=False)
             if (not resp.ok and re.search(
                     r"top_k|presence_penalty|unsupported|unknown.*(param|field|key)",
                     resp.text or "", re.IGNORECASE)):
@@ -335,7 +428,7 @@ class CaptionerModule(Module):
                 fallback_payload.pop("top_k", None)
                 fallback_payload.pop("presence_penalty", None)
                 resp = requests.post(f"{cfg['api_url']}/chat/completions",
-                                     json=fallback_payload, timeout=120)
+                                     json=fallback_payload, timeout=120, headers=auth_headers(cfg), allow_redirects=False)
             resp.raise_for_status()
             caption_text = self._ensure_trigger_prefix(
                 resp.json()["choices"][0]["message"]["content"], trigger
@@ -811,7 +904,7 @@ PAGE_BODY = r"""
 .cap-workspace-header p { margin-top:3px; font-size:12px; color:var(--text-dim); }
 .cap-settings-link { display:inline-flex; align-items:center; gap:8px; background:none; border:0; color:var(--accent); font:inherit; cursor:pointer; padding:8px 0 8px 12px; }
 #capCentralLink { color:var(--accent); font-size:12px; }
-#capApiField[hidden], #capTransportField[hidden] { display:none; }
+#capApiField[hidden], #capTransportField[hidden], #capApiKeyField[hidden] { display:none; }
 #capConnectionNote { overflow-wrap:anywhere; }
 .cap-settings-link:hover { color:var(--text-bright); text-decoration:underline; }
 .cap-app :is(button, select, input, textarea):focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
@@ -1087,10 +1180,16 @@ PAGE_BODY = r"""
                     <input class="cap-input" id="capApiUrl" type="text" required spellcheck="false" placeholder="http://localhost:1234">
                     <div class="cap-field-note">Your LM Studio or OpenAI-compatible server. With or without <code>/v1</code>.</div>
                 </div>
+                <div class="cap-field" id="capApiKeyField">
+                    <label for="capApiKey">API key (optional)</label>
+                    <input class="cap-input" id="capApiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="Only if your server requires a key">
+                    <label><input id="capClearApiKey" type="checkbox"> Remove saved API key</label>
+                    <div class="cap-field-note">Leave blank to keep the saved key. A different server address clears it unless you enter a new key.</div>
+                </div>
                 <div class="cap-field" id="capTransportField">
                     <label for="capTransport">Connect from</label>
                     <select class="cap-input" id="capTransport"><option value="auto">Browser, then CyberHub (existing behavior)</option><option value="hub">CyberHub computer</option><option value="browser">Browser computer</option></select>
-                    <div class="cap-field-note">localhost refers to the selected computer.</div>
+                    <div class="cap-field-note">localhost refers to the selected computer. Browser connections send the API key through this browser.</div>
                 </div>
                 <div class="cap-field">
                     <label for="capModel">Model override for Captioner</label>
@@ -1380,6 +1479,8 @@ async function init() {
 }
 
 function populateConnectionForm(cfg) {
+  document.getElementById('capApiKey').value = '';
+  document.getElementById('capClearApiKey').checked = false;
   const mode = document.getElementById('capConnectionMode');
   mode.value = cfg.connection_mode || 'custom';
   mode.disabled = !cfg.central_available;
@@ -1397,6 +1498,12 @@ function updateCaptionerConnectionMode(switched=true) {
   const cfg = state.config || {};
   const shared = document.getElementById('capConnectionMode').value === 'shared';
   const values = shared ? cfg.shared || {} : cfg.custom || cfg;
+  document.getElementById('capApiKeyField').hidden = shared;
+  document.getElementById('capApiKey').placeholder = values.api_key_set ? 'API key saved — leave blank to keep' : 'Only if your server requires a key';
+  if (switched) {
+    document.getElementById('capApiKey').value = '';
+    document.getElementById('capClearApiKey').checked = false;
+  }
   if (switched) {
     document.getElementById('capApiUrl').value = values.api_url || 'http://localhost:1234/v1';
     document.getElementById('capTransport').value = values.transport || 'auto';
@@ -1478,12 +1585,20 @@ function optionalFormNumber(id, integer=false) {
   return Number.isFinite(value) ? value : null;
 }
 
+function captionerKeyDraft(shared) {
+  if (shared) return {};
+  if (document.getElementById('capClearApiKey').checked) return {api_key:''};
+  const key = document.getElementById('capApiKey').value.trim();
+  return key ? {api_key:key} : {};
+}
 function readConnectionForm() {
   const apiUrl = normalizeCaptionerApiUrl(document.getElementById('capApiUrl').value);
   document.getElementById('capApiUrl').value = apiUrl;
   const shared = document.getElementById('capConnectionMode').value === 'shared';
   const model = (document.getElementById('capModel').value || '').trim();
   return {
+    ...captionerKeyDraft(shared),
+    api_key_set: !!(shared ? state.config?.shared?.api_key_set : (state.config?.custom || state.config)?.api_key_set),
     central_available: !!state.config?.central_available,
     connection_mode: shared ? 'shared' : 'custom',
     shared_model: shared ? model : '',
@@ -1547,12 +1662,22 @@ async function detectCaptionerModel() {
   }
 }
 
+async function captionerBrowserHeaders(cfg, saved=false) {
+  if (cfg.api_key === '' || (!cfg.api_key_set && !cfg.api_key)) return {};
+  const response = await fetch('/api/captioner/browser-connection', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/json'}, body:JSON.stringify(saved ? {saved:true} : cfg)});
+  const credentials = await response.json();
+  if (!response.ok || credentials.error) throw new Error(credentials.error || 'Could not read the saved API key');
+  if (normalizeCaptionerApiUrl(credentials.api_url) !== normalizeCaptionerApiUrl(cfg.api_url)) throw new Error('Connection changed. Please retry.');
+  return credentials.api_key ? {Authorization:'Bearer ' + credentials.api_key} : {};
+}
+
 async function fetchCaptionerModels(cfg=state.config || {}) {
   if (cfg.connection_error || (cfg.connection_mode === 'shared' && !cfg.api_url)) throw new Error(cfg.connection_error || 'Save a central connection in Settings first.');
   let directError = null;
   try {
     if (cfg.transport === 'hub') throw new Error('Use CyberHub');
-    const r = await fetch(normalizeCaptionerApiUrl(cfg.api_url) + '/models', { signal: AbortSignal.timeout(5000) });
+    const headers = await captionerBrowserHeaders(cfg);
+    const r = await fetch(normalizeCaptionerApiUrl(cfg.api_url) + '/models', { headers, redirect:'error', signal: AbortSignal.timeout(5000) });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error?.message || data.error || `HTTP ${r.status}`);
     const models = (data.data || []).map(item => item && item.id).filter(Boolean);
@@ -1562,22 +1687,10 @@ async function fetchCaptionerModels(cfg=state.config || {}) {
     directError = e;
     if (cfg.transport === 'browser') throw e;
   }
-  if (cfg.central_available) {
-    const response = await fetch('/api/ai/models', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...cfg, transport:'hub'})});
-    const data = await response.json();
-    if (!response.ok || data.error || !data.models?.length) throw new Error(data.error || 'No models found');
-    return {models:data.models, via:'hub'};
-  }
-
-  if (normalizeCaptionerApiUrl(cfg.api_url) !== normalizeCaptionerApiUrl(state.config?.api_url)) {
-    throw new Error('Save this API URL first to detect models through CyberHub.');
-  }
-  const r = await fetch('/api/captioner/models');
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok || data.error || !(data.models || []).length) {
-    throw new Error(data.error || directError?.message || 'No models found');
-  }
-  return { models: data.models, via: 'hub' };
+  const response = await fetch('/api/captioner/models', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)});
+  const data = await response.json();
+  if (!response.ok || data.error || !data.models?.length) throw new Error(data.error || directError?.message || 'No models found');
+  return {models:data.models, via:'hub'};
 }
 
 /* Saved captioner presets are Library cards with type='captioner'. Built-in
@@ -2491,6 +2604,7 @@ function buildDirectCaptionPayload(imageB64, mediaType, systemPrompt) {
 
 async function captionViaBrowser(imageB64, mediaType, trigger, systemPrompt, signal) {
   const request = buildDirectCaptionPayload(imageB64, mediaType, systemPrompt);
+  const headers = await captionerBrowserHeaders(request.cfg, true);
   const controller = new AbortController();
   let timedOut = false;
   const abortFromBatch = () => controller.abort();
@@ -2501,8 +2615,8 @@ async function captionViaBrowser(imageB64, mediaType, trigger, systemPrompt, sig
     controller.abort();
   }, 120000);
   const post = payload => fetch(request.cfg.api_url + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'POST', redirect:'error',
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(payload),
     signal: controller.signal
   });
